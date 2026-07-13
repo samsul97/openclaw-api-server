@@ -1,5 +1,6 @@
 const express = require('express');
 const { exec, execSync } = require('child_process');
+const https = require('https');
 const path = require('path');
 const fs = require('fs');
 
@@ -10,6 +11,22 @@ const PORT = 18799;
 const HOST = '127.0.0.1';
 const API_TOKEN = process.env.OPENCLAW_API_TOKEN || 'changeme-set-env-var';
 const SCRIPTS_DIR = '/root';
+
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8731741557:AAFjdZjoXrcCdZPTHiJFjCjuo2ZRtOYP8YE';
+const TELEGRAM_CHAT  = process.env.TELEGRAM_CHAT_ID  || '652689793';
+
+function sendTelegram(text) {
+  const body = JSON.stringify({ chat_id: TELEGRAM_CHAT, text, parse_mode: 'HTML' });
+  const req = https.request({
+    hostname: 'api.telegram.org',
+    path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+  });
+  req.on('error', () => {});
+  req.write(body);
+  req.end();
+}
 
 const WORKSPACE_FILES = new Set([
   'SOUL.md',
@@ -607,6 +624,118 @@ app.delete('/clients/:name/groups/:groupId', (req, res) => {
   }
 
   res.status(404).json({ ok: false, error: 'Group not found' });
+});
+
+// ── Telegram Notification ────────────────────────────────────────────────────
+
+app.post('/notify', (req, res) => {
+  const { text, order } = req.body;
+
+  let message = text;
+
+  if (!message && order) {
+    const a = order;
+    const slots = (a.assistant_slots || []).map(s => s.type).join(', ') || '-';
+    message = [
+      '🔔 <b>Order Baru Masuk!</b>',
+      '',
+      `👤 <b>Nama:</b> ${a.full_name || '-'}`,
+      `📱 <b>WA:</b> ${a.contact_whatsapp || '-'}`,
+      a.email ? `📧 <b>Email:</b> ${a.email}` : null,
+      `🤖 <b>Asisten:</b> ${slots}`,
+      `📦 <b>Paket:</b> ${a.plan || '-'}`,
+      `🔧 <b>Mode:</b> ${a.wa_mode || '-'}`,
+      a.preferred_assistant_name ? `💬 <b>Nama Asisten:</b> ${a.preferred_assistant_name}` : null,
+      a.preferred_trigger_word   ? `⚡ <b>Trigger:</b> ${a.preferred_trigger_word}` : null,
+      a.onboarding_notes         ? `📝 <b>Catatan:</b> ${a.onboarding_notes}` : null,
+      '',
+      `🔗 <a href="https://samsulhadissbackend.samsulhadiss.com/samsulhadiss/openclaw/orders">Buka Dashboard</a>`,
+    ].filter(l => l !== null).join('\n');
+  }
+
+  if (!message) return res.status(400).json({ ok: false, error: 'text or order required' });
+
+  sendTelegram(message);
+  res.json({ ok: true, message: 'Notification sent' });
+});
+
+// ── Auto Create WhatsApp Group ───────────────────────────────────────────────
+
+app.post('/clients/:name/groups/create', (req, res) => {
+  const { name } = req.params;
+  if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
+
+  const config = getClientConfig(name);
+  if (!config) return res.status(404).json({ ok: false, error: 'Client not found' });
+
+  const { user_phone, group_name } = req.body;
+  if (!user_phone) return res.status(400).json({ ok: false, error: 'user_phone is required' });
+  if (!group_name) return res.status(400).json({ ok: false, error: 'group_name is required' });
+  if (!/^\+62[0-9]{9,13}$/.test(user_phone)) {
+    return res.status(400).json({ ok: false, error: 'user_phone must be E.164 starting with +62' });
+  }
+
+  const paths = clientPaths(name);
+  const credsDir = path.join(paths.stateDir, 'credentials', 'whatsapp', 'default');
+
+  if (!fs.existsSync(path.join(credsDir, 'creds.json'))) {
+    return res.status(400).json({
+      ok: false,
+      error: 'WhatsApp session not found. Run: openclaw --profile ' + name + ' channels login --channel whatsapp',
+    });
+  }
+
+  const scriptPath = path.join(__dirname, 'wa-create-group.js');
+  const nodebin = process.execPath;
+
+  // Stop gateway → create group → restart gateway
+  try {
+    const svc = paths.serviceName;
+    const scope = paths.serviceScope === 'system' ? '' : '--user ';
+    try { run(`systemctl ${scope}stop ${quote(svc)}`); } catch {}
+
+    const cmd = `${quote(nodebin)} ${quote(scriptPath)} ${quote(credsDir)} ${quote(group_name)} ${quote(user_phone)}`;
+
+    exec(cmd, { encoding: 'utf8', timeout: 60000 }, (error, stdout) => {
+      // Always restart gateway regardless of outcome
+      try { run(`systemctl ${scope}start ${quote(paths.serviceName)}`); } catch {}
+
+      let result;
+      try { result = JSON.parse(stdout.trim()); } catch {
+        return res.status(500).json({ ok: false, error: 'Failed to parse group creation output', raw: stdout.slice(0, 200) });
+      }
+
+      if (!result.ok) {
+        return res.status(500).json(result);
+      }
+
+      // Auto-register the new group into the client config
+      const updatedConfig = getClientConfig(name);
+      if (updatedConfig) {
+        updatedConfig.channels = updatedConfig.channels || {};
+        updatedConfig.channels.whatsapp = updatedConfig.channels.whatsapp || {};
+        updatedConfig.channels.whatsapp.groups = updatedConfig.channels.whatsapp.groups || {};
+        updatedConfig.channels.whatsapp.groups[result.group_id] = {
+          name: group_name,
+          requireMention: true,
+          assistantSlot: 1,
+        };
+        writeClientConfig(name, updatedConfig);
+      }
+
+      sendTelegram(
+        `✅ <b>Group WA berhasil dibuat!</b>\n\n` +
+        `👤 Client: <code>${name}</code>\n` +
+        `👥 Group: <b>${group_name}</b>\n` +
+        `🆔 ID: <code>${result.group_id}</code>` +
+        (result.invite_link ? `\n🔗 <a href="${result.invite_link}">Link Undangan</a>` : '')
+      );
+
+      res.json({ ok: true, success: true, ...result, group_registered: true });
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 app.listen(PORT, HOST, () => {
