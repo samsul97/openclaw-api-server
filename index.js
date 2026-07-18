@@ -1,5 +1,5 @@
 const express = require('express');
-const { exec, execSync } = require('child_process');
+const { exec, execSync, execFileSync } = require('child_process');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
@@ -11,6 +11,9 @@ const PORT = 18799;
 const HOST = '127.0.0.1';
 const API_TOKEN = process.env.OPENCLAW_API_TOKEN || 'changeme-set-env-var';
 const SCRIPTS_DIR = '/root';
+const NODE_BIN = '/root/.nvm/versions/node/v22.22.0/bin/node';
+const OPENCLAW_BIN = '/root/.nvm/versions/node/v22.22.0/lib/node_modules/openclaw/dist/index.js';
+const CLAUDE_BIN = '/root/.nvm/versions/node/v22.22.0/bin/claude';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8731741557:AAFjdZjoXrcCdZPTHiJFjCjuo2ZRtOYP8YE';
 const TELEGRAM_CHAT  = process.env.TELEGRAM_CHAT_ID  || '652689793';
@@ -37,6 +40,11 @@ const WORKSPACE_FILES = new Set([
   'HEARTBEAT.md',
 ]);
 
+const VALID_ASSISTANT_TYPES = [
+  'finance', 'health', 'admin', 'career', 'religious',
+  'parenting', 'kitchen', 'vehicle', 'creator', 'affiliate', 'coding', 'custom',
+];
+
 // Accepts root-level WORKSPACE_FILES and one-level subfolder paths like keuangan/AGENTS.md
 function isAllowedWorkspaceFile(file) {
   if (!file || typeof file !== 'string') return false;
@@ -49,6 +57,16 @@ function isAllowedWorkspaceFile(file) {
   if (!/^[a-z][a-z0-9_-]*$/.test(folder)) return false;
   if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) return false;
   return true;
+}
+
+function openClawEnv(paths) {
+  return {
+    ...process.env,
+    OPENCLAW_STATE_DIR: paths.stateDir,
+    OPENCLAW_CONFIG_PATH: paths.configPath,
+    CODEX_HOME: paths.codexHome,
+    HOME: paths.home,
+  };
 }
 
 function run(cmd, options = {}) {
@@ -227,6 +245,7 @@ function extractClient(config, name) {
 
 function buildConfigFromDashboard(name, payload, existing = {}) {
   const paths = clientPaths(name);
+  const waMode = payload.wa_mode || existing.meta?.waMode || 'client_number_bot';
   const trigger = payload.trigger || existing.agents?.list?.[0]?.groupChat?.mentionPatterns?.[0] || 'Hey';
   const port = Number(payload.server_port || existing.gateway?.port || 0) || undefined;
   const allowFrom = Array.isArray(payload.allowFrom) ? payload.allowFrom : (existing.channels?.whatsapp?.allowFrom || []);
@@ -245,12 +264,13 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
   const model = payload.primary_model || existing.agents?.defaults?.model?.primary || 'openai/gpt-5.5';
   const fallbacks = Array.isArray(payload.fallback_models) ? payload.fallback_models : [];
 
-  return {
+  const next = {
     ...existing,
     meta: {
       ...(existing.meta || {}),
       name,
-      assistantType: payload.assistant_type || existing.meta?.assistantType || 'custom',
+      assistantType: payload.assistant_type || payload.assistants?.[0]?.type || existing.meta?.assistantType || 'custom',
+      waMode,
       dashboardManaged: true,
       assistants: payload.assistants || [],
       integrations: payload.integrations || [],
@@ -290,7 +310,9 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
         dmPolicy: payload.dm_policy || existing.channels?.whatsapp?.dmPolicy || 'allowlist',
         allowFrom,
         groupPolicy: payload.group_policy || existing.channels?.whatsapp?.groupPolicy || 'allowlist',
-        groupAllowFrom: inferGlobalGroupAllowFrom(payload.groups || [], allowFrom, existing.channels?.whatsapp?.groupAllowFrom || []),
+        groupAllowFrom: Array.isArray(payload.group_allow_from)
+          ? payload.group_allow_from
+          : inferGlobalGroupAllowFrom(payload.groups || [], allowFrom, existing.channels?.whatsapp?.groupAllowFrom || []),
         groups,
         debounceMs: payload.debounce_ms ?? existing.channels?.whatsapp?.debounceMs ?? 3000,
         sendReadReceipts: Boolean(payload.send_read_receipts),
@@ -312,6 +334,12 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
       },
     },
   };
+
+  if (waMode === 'managed_group_employee') {
+    delete next.channels.whatsapp;
+  }
+
+  return next;
 }
 
 function inferGlobalGroupAllowFrom(groups, allowFrom, existing) {
@@ -361,6 +389,58 @@ app.get('/clients', (_req, res) => {
   res.json(clients);
 });
 
+app.post('/clients/validate-provision', (req, res) => {
+  const { name, phone, wa_mode = 'client_number_bot', assistants = [], files = {}, config = {}, crons = [] } = req.body || {};
+  const errors = [];
+
+  if (!validName(name)) errors.push('Invalid client name');
+  if (!/^\+62[0-9]{9,13}$/.test(String(phone || ''))) errors.push('Invalid Indonesian E.164 phone');
+  if (!['client_number_bot', 'managed_group_employee'].includes(wa_mode)) errors.push('Invalid wa_mode');
+  if (!Array.isArray(assistants) || assistants.length === 0) errors.push('At least one assistant is required');
+  for (const assistant of assistants || []) {
+    if (!VALID_ASSISTANT_TYPES.includes(assistant.type)) errors.push(`Invalid assistant type: ${assistant.type || ''}`);
+  }
+  if (!files || typeof files !== 'object' || Array.isArray(files)) errors.push('files must be an object');
+  for (const file of Object.keys(files || {})) {
+    if (!isAllowedWorkspaceFile(file)) errors.push(`Unsupported workspace file: ${file}`);
+  }
+  if (!config || typeof config !== 'object' || Array.isArray(config)) errors.push('config must be an object');
+  if (wa_mode === 'client_number_bot' && config && typeof config === 'object') {
+    const plan = config.plan;
+    const expectedDm = plan === 'pro' ? 'allowlist' : 'disabled';
+    const expectedGroupAllow = plan === 'personal' ? [phone] : ['*'];
+    if (!['personal', 'plus', 'pro'].includes(plan)) errors.push('Invalid or missing config.plan');
+    if (config.dm_policy !== expectedDm) errors.push(`Invalid dm_policy for ${plan || 'unknown'} plan`);
+    if (config.group_policy !== 'allowlist') errors.push('group_policy must be allowlist');
+    if (JSON.stringify(config.group_allow_from || []) !== JSON.stringify(expectedGroupAllow)) {
+      errors.push(`Invalid group_allow_from for ${plan || 'unknown'} plan`);
+    }
+    const expectedDmAllow = plan === 'pro' ? [phone] : [];
+    if (JSON.stringify(config.allowFrom || []) !== JSON.stringify(expectedDmAllow)) {
+      errors.push(`Invalid allowFrom for ${plan || 'unknown'} plan`);
+    }
+  }
+  if (!Array.isArray(crons)) errors.push('crons must be an array');
+  for (const cron of crons || []) {
+    if (!/^[a-z][a-z0-9_-]*$/.test(String(cron.slug || ''))) errors.push(`Invalid cron slug: ${cron.slug || ''}`);
+    if (!/^\S+(\s+\S+){4}$/.test(String(cron.schedule || ''))) errors.push(`Invalid cron schedule: ${cron.slug || ''}`);
+    if (!cron.message || typeof cron.message !== 'string') errors.push(`Missing cron message: ${cron.slug || ''}`);
+    if (cron.enabled !== false) errors.push(`Cron must start disabled: ${cron.slug || ''}`);
+  }
+
+  res.status(errors.length ? 422 : 200).json({
+    ok: errors.length === 0,
+    dry_run: true,
+    errors,
+    summary: {
+      assistants: Array.isArray(assistants) ? assistants.length : 0,
+      workspace_files: files && typeof files === 'object' && !Array.isArray(files) ? Object.keys(files).length : 0,
+      config_keys: config && typeof config === 'object' && !Array.isArray(config) ? Object.keys(config) : [],
+      crons: Array.isArray(crons) ? crons.length : 0,
+    },
+  });
+});
+
 app.get('/clients/:name', (req, res) => {
   const { name } = req.params;
   if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
@@ -391,7 +471,7 @@ app.post('/clients', (req, res) => {
   if (!validName(name)) return res.status(400).json({ ok: false, error: 'name must be lowercase alphanumeric/dash/underscore' });
   if (!/^\+62[0-9]{9,13}$/.test(phone)) return res.status(400).json({ ok: false, error: 'phone must be E.164 format starting with +62' });
   if (!['personal', 'team'].includes(scope_package)) return res.status(400).json({ ok: false, error: 'scope_package must be personal or team' });
-  if (!['creator', 'finance', 'jobseeker', 'custom'].includes(assistant_type)) return res.status(400).json({ ok: false, error: 'assistant_type must be creator|finance|jobseeker|custom' });
+  if (!VALID_ASSISTANT_TYPES.includes(assistant_type)) return res.status(400).json({ ok: false, error: `assistant_type must be one of: ${VALID_ASSISTANT_TYPES.join('|')}` });
 
   const cmd = `bash ${quote(path.join(SCRIPTS_DIR, 'create-client.sh'))} ${quote(name)} ${quote(trigger)} ${quote(phone)} ${quote(scope_package)} ${quote(assistant_type)} 2>&1`;
 
@@ -538,6 +618,191 @@ app.post('/clients/:name/workspace', (req, res) => {
   res.json({ ok: true, success: true, written, workspace_dir: paths.workspaceDir });
 });
 
+app.put('/clients/:name/crons', (req, res) => {
+  const { name } = req.params;
+  if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
+  const config = getClientConfig(name);
+  if (!config) return res.status(404).json({ ok: false, error: 'Client not found' });
+
+  const jobs = req.body?.jobs;
+  if (!Array.isArray(jobs)) return res.status(400).json({ ok: false, error: 'jobs array is required' });
+
+  const errors = [];
+  for (const job of jobs) {
+    if (!/^[a-z][a-z0-9_-]*$/.test(String(job.slug || ''))) errors.push(`Invalid cron slug: ${job.slug || ''}`);
+    if (!/^\S+(\s+\S+){4}$/.test(String(job.schedule || ''))) errors.push(`Invalid cron schedule: ${job.slug || ''}`);
+    if (!job.message || typeof job.message !== 'string') errors.push(`Missing cron message: ${job.slug || ''}`);
+    if (job.enabled !== false) errors.push(`Provisioned cron must start disabled: ${job.slug || ''}`);
+  }
+  if (errors.length) return res.status(422).json({ ok: false, errors });
+
+  const port = config.gateway?.port;
+  const token = config.gateway?.auth?.token;
+  if (!port || !token) return res.status(422).json({ ok: false, error: 'Gateway port/token missing' });
+  const connection = ['--url', `ws://127.0.0.1:${port}`, '--token', token];
+
+  try {
+    const raw = execFileSync(NODE_BIN, [OPENCLAW_BIN, 'cron', 'list', '--json', ...connection], {
+      encoding: 'utf8', timeout: 30000,
+    });
+    const parsed = JSON.parse(raw || '{}');
+    const existingJobs = Array.isArray(parsed) ? parsed : (parsed.jobs || []);
+    const existingByName = new Map(existingJobs.map((job) => [job.name, job]));
+    const created = [];
+    const existing = [];
+
+    for (const job of jobs) {
+      if (existingByName.has(job.slug)) {
+        const current = existingByName.get(job.slug);
+        if (!current.id) throw new Error(`Existing cron has no id: ${job.slug}`);
+        execFileSync(NODE_BIN, [
+          OPENCLAW_BIN, 'cron', 'edit', current.id,
+          '--cron', job.schedule, '--tz', job.timezone || 'Asia/Jakarta',
+          '--agent', job.agent || 'main', '--session', job.session || 'isolated',
+          '--message', job.message, '--disable', '--no-deliver', ...connection,
+        ], { encoding: 'utf8', timeout: 30000 });
+        existing.push(job.slug);
+        continue;
+      }
+      execFileSync(NODE_BIN, [
+        OPENCLAW_BIN, 'cron', 'add', '--json', '--name', job.slug,
+        '--cron', job.schedule, '--tz', job.timezone || 'Asia/Jakarta',
+        '--agent', job.agent || 'main', '--session', job.session || 'isolated',
+        '--message', job.message, '--disabled', '--no-deliver', ...connection,
+      ], { encoding: 'utf8', timeout: 30000 });
+      created.push(job.slug);
+    }
+
+    res.json({ ok: true, success: true, created, existing, enabled: 0 });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: 'Cron sync failed', detail: String(error.stderr || error.message || '').trim() });
+  }
+});
+
+app.post('/clients/:name/workspace/adapt', (req, res) => {
+  const { name } = req.params;
+  if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
+  const paths = clientPaths(name);
+  if (!getClientConfig(name)) return res.status(404).json({ ok: false, error: 'Client not found' });
+
+  const manifest = req.body?.manifest;
+  const allowedPaths = manifest?.output_contract?.allowed_paths;
+  if (manifest?.schema_version !== 1 || !Array.isArray(allowedPaths)) {
+    return res.status(422).json({ ok: false, error: 'Invalid onboarding adapter manifest' });
+  }
+  if (allowedPaths.some((file) => !isAllowedWorkspaceFile(file))) {
+    return res.status(422).json({ ok: false, error: 'Manifest contains unsupported workspace paths' });
+  }
+  if (!fs.existsSync(CLAUDE_BIN)) return res.status(503).json({ ok: false, error: 'Claude adapter is unavailable' });
+
+  const schema = JSON.stringify({
+    type: 'object', additionalProperties: false, required: ['files'],
+    properties: {
+      files: {
+        type: 'object',
+        propertyNames: { enum: allowedPaths },
+        additionalProperties: { type: 'string', maxLength: 100000 },
+      },
+    },
+  });
+  const prompt = [
+    'Adapt onboarding data into client-specific workspace content.',
+    'Return JSON only according to the supplied schema.',
+    'Do not return or alter config, credentials, integrations, cron, router, or infrastructure.',
+    'Only include a file when onboarding data materially improves it; preserve the base template structure, preserve facts, and never invent personal data.',
+    'Current allowed base files:',
+    JSON.stringify(Object.fromEntries(allowedPaths.map((file) => {
+      const target = path.resolve(paths.workspaceDir, file);
+      return [file, fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : ''];
+    }))),
+    JSON.stringify(manifest),
+  ].join('\n\n');
+
+  try {
+    const raw = execFileSync(CLAUDE_BIN, [
+      '--print', '--model', 'sonnet', '--output-format', 'json', '--json-schema', schema,
+      '--tools', '', '--permission-mode', 'dontAsk', prompt,
+    ], { encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024, cwd: paths.workspaceDir });
+    const envelope = JSON.parse(raw);
+    const output = envelope.structured_output || envelope.result || envelope;
+    const files = output.files || {};
+    const written = [];
+    for (const [file, content] of Object.entries(files)) {
+      if (!allowedPaths.includes(file) || !isAllowedWorkspaceFile(file) || typeof content !== 'string') {
+        throw new Error(`Adapter returned forbidden file: ${file}`);
+      }
+      const target = path.resolve(paths.workspaceDir, file);
+      if (!target.startsWith(path.resolve(paths.workspaceDir) + path.sep)) throw new Error('Adapter path traversal');
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, content);
+      chownIfHome(paths, target);
+      written.push(file);
+    }
+    res.json({ ok: true, adapted: true, written });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: 'Structured workspace adaptation failed', detail: String(error.stderr || error.message || '').slice(0, 1000) });
+  }
+});
+
+app.post('/clients/:name/verify-prerequisites', (req, res) => {
+  const { name } = req.params;
+  if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
+  const paths = clientPaths(name);
+  const config = getClientConfig(name);
+  if (!config) return res.status(404).json({ ok: false, error: 'Client not found' });
+  const env = openClawEnv(paths);
+  let modelAuth = false;
+  let modelDetail = '';
+  try {
+    modelDetail = execFileSync(NODE_BIN, [OPENCLAW_BIN, 'models', 'status', '--check', '--json'], {
+      encoding: 'utf8', timeout: 60000, env,
+    });
+    modelAuth = true;
+  } catch (error) {
+    modelDetail = String(error.stderr || error.stdout || error.message || '').slice(0, 1000);
+  }
+
+  const waMode = config.meta?.waMode || 'client_number_bot';
+  const waCredentials = path.join(paths.stateDir, 'credentials', 'whatsapp', 'default', 'creds.json');
+  const whatsapp = waMode === 'managed_group_employee' ? true : fs.existsSync(waCredentials);
+  const result = {
+    ok: modelAuth && whatsapp,
+    model_auth_ok: modelAuth,
+    whatsapp_connected: whatsapp,
+    wa_mode: waMode,
+    model_detail: modelDetail,
+  };
+  res.status(result.ok ? 200 : 422).json(result);
+});
+
+app.post('/clients/:name/crons/activate', (req, res) => {
+  const { name } = req.params;
+  if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
+  const config = getClientConfig(name);
+  if (!config) return res.status(404).json({ ok: false, error: 'Client not found' });
+  const jobs = req.body?.jobs;
+  const target = String(req.body?.target || '');
+  if (!Array.isArray(jobs) || !target) return res.status(422).json({ ok: false, error: 'jobs and delivery target are required' });
+  if (!/^120[0-9]+@g\.us$/.test(target) && !/^\+[1-9][0-9]{6,14}$/.test(target)) {
+    return res.status(422).json({ ok: false, error: 'Invalid WhatsApp delivery target' });
+  }
+  const connection = ['--url', `ws://127.0.0.1:${config.gateway?.port}`, '--token', config.gateway?.auth?.token];
+  try {
+    const raw = execFileSync(NODE_BIN, [OPENCLAW_BIN, 'cron', 'list', '--json', ...connection], { encoding: 'utf8', timeout: 30000 });
+    const existing = Array.isArray(JSON.parse(raw)) ? JSON.parse(raw) : (JSON.parse(raw).jobs || []);
+    const requested = new Set(jobs.map((job) => job.slug));
+    const enabled = [];
+    for (const job of existing) {
+      if (!requested.has(job.name) || !job.id) continue;
+      execFileSync(NODE_BIN, [OPENCLAW_BIN, 'cron', 'edit', job.id, '--enable', '--announce', '--channel', 'whatsapp', '--to', target, ...connection], { encoding: 'utf8', timeout: 30000 });
+      enabled.push(job.name);
+    }
+    res.json({ ok: true, enabled, channel: 'whatsapp', target });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: 'Cron activation failed', detail: String(error.stderr || error.message || '').slice(0, 1000) });
+  }
+});
+
 app.post('/clients/:name/groups', (req, res) => {
   const { name } = req.params;
   if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
@@ -635,19 +900,23 @@ app.post('/notify', (req, res) => {
 
   if (!message && order) {
     const a = order;
-    const slots = (a.assistant_slots || []).map(s => s.type).join(', ') || '-';
+    const rawSlots = a.assistant_slots || [];
+    const slots = Array.isArray(rawSlots)
+      ? rawSlots.map(s => s.type || s).join(', ') || '-'
+      : String(rawSlots) || '-';
+    const contactWa = a.contact_wa || a.contact_whatsapp || '-';
     message = [
       '🔔 <b>Order Baru Masuk!</b>',
       '',
       `👤 <b>Nama:</b> ${a.full_name || '-'}`,
-      `📱 <b>WA:</b> ${a.contact_whatsapp || '-'}`,
+      `📱 <b>WA:</b> ${contactWa}`,
       a.email ? `📧 <b>Email:</b> ${a.email}` : null,
       `🤖 <b>Asisten:</b> ${slots}`,
       `📦 <b>Paket:</b> ${a.plan || '-'}`,
       `🔧 <b>Mode:</b> ${a.wa_mode || '-'}`,
       a.preferred_assistant_name ? `💬 <b>Nama Asisten:</b> ${a.preferred_assistant_name}` : null,
       a.preferred_trigger_word   ? `⚡ <b>Trigger:</b> ${a.preferred_trigger_word}` : null,
-      a.onboarding_notes         ? `📝 <b>Catatan:</b> ${a.onboarding_notes}` : null,
+      a.notes || a.onboarding_notes ? `📝 <b>Catatan:</b> ${a.notes || a.onboarding_notes}` : null,
       '',
       `🔗 <a href="https://samsulhadissbackend.samsulhadiss.com/samsulhadiss/openclaw/orders">Buka Dashboard</a>`,
     ].filter(l => l !== null).join('\n');
@@ -668,11 +937,12 @@ app.post('/clients/:name/groups/create', (req, res) => {
   const config = getClientConfig(name);
   if (!config) return res.status(404).json({ ok: false, error: 'Client not found' });
 
-  const { user_phone, group_name } = req.body;
-  if (!user_phone) return res.status(400).json({ ok: false, error: 'user_phone is required' });
+  const user_phone = req.body.user_phone || req.body.member_phone;
+  const group_name = req.body.group_name;
+  if (!user_phone) return res.status(400).json({ ok: false, error: 'user_phone (or member_phone) is required' });
   if (!group_name) return res.status(400).json({ ok: false, error: 'group_name is required' });
-  if (!/^\+62[0-9]{9,13}$/.test(user_phone)) {
-    return res.status(400).json({ ok: false, error: 'user_phone must be E.164 starting with +62' });
+  if (!/^\+?[0-9]{8,15}$/.test(user_phone.replace(/\s/g, ''))) {
+    return res.status(400).json({ ok: false, error: 'user_phone must be a valid phone number' });
   }
 
   const paths = clientPaths(name);
@@ -738,7 +1008,152 @@ app.post('/clients/:name/groups/create', (req, res) => {
   }
 });
 
+// ── Managed Router ───────────────────────────────────────────────────────────
+// Convention:
+//   Creds dir : /root/.openclaw/managed-accounts/{id}/credentials/whatsapp/default/
+//   Routes    : /root/.openclaw/managed-accounts/{id}/routes.json
+//   Service   : openclaw-managed-{id}-gateway.service
+
+function managedAccountPaths(accountId) {
+  const base = `/root/.openclaw/managed-accounts/${accountId}`;
+  return {
+    base,
+    credsDir:  `${base}/credentials/whatsapp/default`,
+    routesFile: `${base}/routes.json`,
+    serviceName: `openclaw-managed-${accountId}-gateway.service`,
+  };
+}
+
+function readManagedRoutes(accountId) {
+  const { routesFile } = managedAccountPaths(accountId);
+  if (!fs.existsSync(routesFile)) return [];
+  try { return JSON.parse(fs.readFileSync(routesFile, 'utf8')); } catch { return []; }
+}
+
+function writeManagedRoutes(accountId, routes) {
+  const { base, routesFile } = managedAccountPaths(accountId);
+  fs.mkdirSync(base, { recursive: true });
+  fs.writeFileSync(routesFile, JSON.stringify(routes, null, 2) + '\n');
+}
+
+app.get('/managed-router/:accountId/status', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+  const { credsDir, serviceName, routesFile } = managedAccountPaths(accountId);
+  const credsExist = fs.existsSync(path.join(credsDir, 'creds.json'));
+  let serviceStatus = 'unknown';
+  try { serviceStatus = run(`systemctl is-active ${quote(serviceName)} 2>/dev/null; true`); } catch { serviceStatus = 'inactive'; }
+  const routes = readManagedRoutes(accountId);
+  res.json({ ok: true, account_id: accountId, wa_connected: credsExist, service_status: serviceStatus, route_count: routes.length });
+});
+
+app.put('/managed-router/:accountId/routes', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+  const routes = req.body?.routes;
+  if (!Array.isArray(routes)) {
+    return res.status(400).json({ ok: false, error: 'routes array is required' });
+  }
+  writeManagedRoutes(accountId, routes);
+  res.json({ ok: true, success: true, route_count: routes.length });
+});
+
+app.post('/managed-router/:accountId/routes', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+  const route = req.body;
+  if (!route?.group_jid) {
+    return res.status(400).json({ ok: false, error: 'group_jid is required' });
+  }
+  const routes = readManagedRoutes(accountId);
+  const idx = routes.findIndex(r => r.group_jid === route.group_jid);
+  if (idx >= 0) routes[idx] = route; else routes.push(route);
+  writeManagedRoutes(accountId, routes);
+  res.json({ ok: true, success: true, upserted: route.group_jid });
+});
+
+app.delete('/managed-router/:accountId/routes/:groupJid', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+  const groupJid = decodeURIComponent(req.params.groupJid);
+  const routes = readManagedRoutes(accountId);
+  const next = routes.filter(r => r.group_jid !== groupJid);
+  writeManagedRoutes(accountId, next);
+  res.json({ ok: true, success: true, removed: routes.length - next.length });
+});
+
+app.post('/managed-router/:accountId/reload', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+  // Routes are already persisted to file; actual gateway reload happens when
+  // the managed gateway process re-reads routes.json on next message dispatch.
+  res.json({ ok: true, success: true, message: 'Routes file updated; gateway will pick up on next dispatch' });
+});
+
+app.post('/managed-router/:accountId/create-group', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+
+  const { group_name, participant_phone } = req.body;
+  if (!group_name) return res.status(400).json({ ok: false, error: 'group_name is required' });
+  if (!participant_phone) return res.status(400).json({ ok: false, error: 'participant_phone is required' });
+  if (!/^\+?[0-9]{8,15}$/.test(participant_phone.replace(/\s/g, ''))) {
+    return res.status(400).json({ ok: false, error: 'participant_phone must be a valid phone number' });
+  }
+
+  const { credsDir, serviceName } = managedAccountPaths(accountId);
+  if (!fs.existsSync(path.join(credsDir, 'creds.json'))) {
+    return res.status(400).json({
+      ok: false,
+      error: `Managed WA account ${accountId} has no active session. Scan QR first and store creds at: ${credsDir}`,
+    });
+  }
+
+  const scriptPath = path.join(__dirname, 'wa-create-group.js');
+  const nodebin = process.execPath;
+
+  try {
+    try { run(`systemctl stop ${quote(serviceName)} 2>/dev/null || true`); } catch {}
+
+    const cmd = `${quote(nodebin)} ${quote(scriptPath)} ${quote(credsDir)} ${quote(group_name)} ${quote(participant_phone)}`;
+
+    exec(cmd, { encoding: 'utf8', timeout: 60000 }, (error, stdout) => {
+      try { run(`systemctl start ${quote(serviceName)} 2>/dev/null || true`); } catch {}
+
+      let result;
+      try { result = JSON.parse(stdout.trim()); } catch {
+        return res.status(500).json({ ok: false, error: 'Failed to parse group creation output', raw: stdout.slice(0, 200) });
+      }
+
+      if (!result.ok) return res.status(500).json(result);
+
+      sendTelegram(
+        `✅ <b>Group WA Managed berhasil dibuat!</b>\n\n` +
+        `🏦 Account: <code>#${accountId}</code>\n` +
+        `👥 Group: <b>${group_name}</b>\n` +
+        `🆔 JID: <code>${result.group_id}</code>` +
+        (result.invite_link ? `\n🔗 <a href="${result.invite_link}">Link Undangan</a>` : '')
+      );
+
+      res.json({ ok: true, success: true, ...result });
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.listen(PORT, HOST, () => {
   console.log(`OpenClaw API Server running on ${HOST}:${PORT}`);
-  console.log(`Token: ${API_TOKEN.slice(0, 8)}...`);
 });
