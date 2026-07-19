@@ -1,8 +1,9 @@
 const express = require('express');
-const { exec, execSync, execFileSync } = require('child_process');
+const { exec, execSync, execFileSync, spawn } = require('child_process');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -14,6 +15,8 @@ const SCRIPTS_DIR = '/root';
 const NODE_BIN = '/root/.nvm/versions/node/v22.22.0/bin/node';
 const OPENCLAW_BIN = '/root/.nvm/versions/node/v22.22.0/lib/node_modules/openclaw/dist/index.js';
 const CLAUDE_BIN = '/root/.nvm/versions/node/v22.22.0/bin/claude';
+const WHATSAPP_PLUGIN_SPEC = '@openclaw/whatsapp@2026.5.27';
+const managedLoginSessions = new Map();
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8731741557:AAFjdZjoXrcCdZPTHiJFjCjuo2ZRtOYP8YE';
 const TELEGRAM_CHAT  = process.env.TELEGRAM_CHAT_ID  || '652689793';
@@ -71,6 +74,35 @@ function openClawEnv(paths) {
 
 function run(cmd, options = {}) {
   return execSync(cmd, { encoding: 'utf8', timeout: 60000, ...options }).trim();
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function execOpenClawAfterGatewayReady(args, options = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= 8; attempt += 1) {
+    try {
+      return execFileSync(NODE_BIN, [OPENCLAW_BIN, ...args], options);
+    } catch (error) {
+      lastError = error;
+      const detail = String(error.stderr || error.message || '');
+      const transient = /1006|ECONNREFUSED|not yet ready|closed before connect/i.test(detail);
+      if (!transient || attempt === 8) throw error;
+      sleepSync(2000);
+    }
+  }
+  throw lastError;
+}
+
+function readJsonFile(file, fallback) {
+  if (!fs.existsSync(file)) return fallback;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return fallback;
+  }
 }
 
 function runAsync(cmd, res, options = {}) {
@@ -246,6 +278,8 @@ function extractClient(config, name) {
 function buildConfigFromDashboard(name, payload, existing = {}) {
   const paths = clientPaths(name);
   const waMode = payload.wa_mode || existing.meta?.waMode || 'client_number_bot';
+  const existingConfig = { ...existing };
+  delete existingConfig.meta;
   const trigger = payload.trigger || existing.agents?.list?.[0]?.groupChat?.mentionPatterns?.[0] || 'Hey';
   const port = Number(payload.server_port || existing.gateway?.port || 0) || undefined;
   const allowFrom = Array.isArray(payload.allowFrom) ? payload.allowFrom : (existing.channels?.whatsapp?.allowFrom || []);
@@ -265,20 +299,7 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
   const fallbacks = Array.isArray(payload.fallback_models) ? payload.fallback_models : [];
 
   const next = {
-    ...existing,
-    meta: {
-      ...(existing.meta || {}),
-      name,
-      assistantType: payload.assistant_type || payload.assistants?.[0]?.type || existing.meta?.assistantType || 'custom',
-      waMode,
-      dashboardManaged: true,
-      assistants: payload.assistants || [],
-      integrations: payload.integrations || [],
-      linuxUser: payload.linux_user || paths.linuxUser,
-      stateDir: payload.state_dir || paths.stateDir,
-      workspaceDir: payload.workspace_dir || paths.workspaceDir,
-      codexHome: payload.codex_home || paths.codexHome,
-    },
+    ...existingConfig,
     agents: {
       ...(existing.agents || {}),
       defaults: {
@@ -328,7 +349,11 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
     session: existing.session || { dmScope: 'per-channel-peer' },
     tools: existing.tools || { profile: 'coding' },
     plugins: {
+      ...(existing.plugins || {}),
+      allow: [...new Set([...(existing.plugins?.allow || []), 'openai', 'whatsapp'])],
+      bundledDiscovery: 'compat',
       entries: {
+        ...(existing.plugins?.entries || {}),
         openai: { enabled: true },
         whatsapp: { enabled: true },
       },
@@ -337,6 +362,8 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
 
   if (waMode === 'managed_group_employee') {
     delete next.channels.whatsapp;
+    delete next.plugins.entries.whatsapp;
+    next.plugins.allow = next.plugins.allow.filter((id) => id !== 'whatsapp');
   }
 
   return next;
@@ -642,7 +669,7 @@ app.put('/clients/:name/crons', (req, res) => {
   const connection = ['--url', `ws://127.0.0.1:${port}`, '--token', token];
 
   try {
-    const raw = execFileSync(NODE_BIN, [OPENCLAW_BIN, 'cron', 'list', '--json', ...connection], {
+    const raw = execOpenClawAfterGatewayReady(['cron', 'list', '--json', ...connection], {
       encoding: 'utf8', timeout: 30000,
     });
     const parsed = JSON.parse(raw || '{}');
@@ -762,7 +789,10 @@ app.post('/clients/:name/verify-prerequisites', (req, res) => {
     modelDetail = String(error.stderr || error.stdout || error.message || '').slice(0, 1000);
   }
 
-  const waMode = config.meta?.waMode || 'client_number_bot';
+  // Dashboard metadata is intentionally not stored in openclaw.json because
+  // `meta` is not part of the OpenClaw schema. A managed client has no local
+  // WhatsApp channel; delivery is owned by its managed-account gateway.
+  const waMode = config.channels?.whatsapp ? 'client_number_bot' : 'managed_group_employee';
   const waCredentials = path.join(paths.stateDir, 'credentials', 'whatsapp', 'default', 'creds.json');
   const whatsapp = waMode === 'managed_group_employee' ? true : fs.existsSync(waCredentials);
   const result = {
@@ -788,7 +818,7 @@ app.post('/clients/:name/crons/activate', (req, res) => {
   }
   const connection = ['--url', `ws://127.0.0.1:${config.gateway?.port}`, '--token', config.gateway?.auth?.token];
   try {
-    const raw = execFileSync(NODE_BIN, [OPENCLAW_BIN, 'cron', 'list', '--json', ...connection], { encoding: 'utf8', timeout: 30000 });
+    const raw = execOpenClawAfterGatewayReady(['cron', 'list', '--json', ...connection], { encoding: 'utf8', timeout: 30000 });
     const existing = Array.isArray(JSON.parse(raw)) ? JSON.parse(raw) : (JSON.parse(raw).jobs || []);
     const requested = new Set(jobs.map((job) => job.slug));
     const enabled = [];
@@ -939,6 +969,7 @@ app.post('/clients/:name/groups/create', (req, res) => {
 
   const user_phone = req.body.user_phone || req.body.member_phone;
   const group_name = req.body.group_name;
+  const idempotencyKey = req.body.idempotency_key;
   if (!user_phone) return res.status(400).json({ ok: false, error: 'user_phone (or member_phone) is required' });
   if (!group_name) return res.status(400).json({ ok: false, error: 'group_name is required' });
   if (!/^\+?[0-9]{8,15}$/.test(user_phone.replace(/\s/g, ''))) {
@@ -947,6 +978,11 @@ app.post('/clients/:name/groups/create', (req, res) => {
 
   const paths = clientPaths(name);
   const credsDir = path.join(paths.stateDir, 'credentials', 'whatsapp', 'default');
+  const groupRegistryFile = path.join(paths.stateDir, 'provisioned-groups.json');
+  const groupRegistry = readJsonFile(groupRegistryFile, {});
+  if (idempotencyKey && groupRegistry[idempotencyKey]) {
+    return res.json({ ok: true, success: true, ...groupRegistry[idempotencyKey], reused: true, group_registered: true });
+  }
 
   if (!fs.existsSync(path.join(credsDir, 'creds.json'))) {
     return res.status(400).json({
@@ -977,6 +1013,15 @@ app.post('/clients/:name/groups/create', (req, res) => {
 
       if (!result.ok) {
         return res.status(500).json(result);
+      }
+
+      if (idempotencyKey) {
+        groupRegistry[idempotencyKey] = {
+          group_id: result.group_id,
+          invite_link: result.invite_link || null,
+          group_name,
+        };
+        fs.writeFileSync(groupRegistryFile, JSON.stringify(groupRegistry, null, 2) + '\n');
       }
 
       // Auto-register the new group into the client config
@@ -1020,7 +1065,10 @@ function managedAccountPaths(accountId) {
     base,
     credsDir:  `${base}/credentials/whatsapp/default`,
     routesFile: `${base}/routes.json`,
+    configPath: `${base}/openclaw.json`,
+    workspaceDir: `${base}/workspace`,
     serviceName: `openclaw-managed-${accountId}-gateway.service`,
+    serviceFile: `/etc/systemd/system/openclaw-managed-${accountId}-gateway.service`,
   };
 }
 
@@ -1034,6 +1082,141 @@ function writeManagedRoutes(accountId, routes) {
   const { base, routesFile } = managedAccountPaths(accountId);
   fs.mkdirSync(base, { recursive: true });
   fs.writeFileSync(routesFile, JSON.stringify(routes, null, 2) + '\n');
+}
+
+function buildManagedNativeConfig(accountId, routes, account = {}) {
+  const paths = managedAccountPaths(accountId);
+  const existing = readJsonFile(paths.configPath, {});
+  // `meta` is not part of the OpenClaw config schema. Older dashboard builds
+  // wrote provisioning metadata there, causing `channels login` and gateway
+  // startup to fail validation. Keep dashboard metadata in routes/account data
+  // instead and explicitly strip a legacy top-level `meta` on every rebuild.
+  const existingConfig = { ...existing };
+  delete existingConfig.meta;
+  const clients = new Map();
+  for (const route of routes) {
+    if (!route.client_name || !route.agent_workspace || !route.agent_dir) continue;
+    if (!clients.has(route.client_name)) clients.set(route.client_name, route);
+  }
+
+  const agents = [...clients.values()].map((route, index) => ({
+    id: route.client_name,
+    default: index === 0,
+    name: route.client_name,
+    workspace: route.agent_workspace,
+    agentDir: route.agent_dir,
+    model: route.primary_model || 'openai/gpt-5.5',
+    groupChat: {
+      mentionPatterns: [route.trigger || 'Hey', `@${route.trigger || 'Hey'}`],
+    },
+  }));
+  if (agents.length === 0) {
+    agents.push({
+      id: 'bootstrap',
+      default: true,
+      name: 'Managed WhatsApp Bootstrap',
+      workspace: paths.workspaceDir,
+      agentDir: path.join(paths.base, 'agents', 'bootstrap', 'agent'),
+    });
+  }
+
+  const bindings = routes.map((route) => ({
+    agentId: route.client_name,
+    comment: `Managed WA account ${accountId}, assistant slot ${route.assistant_slot || 1}`,
+    match: {
+      channel: 'whatsapp',
+      peer: { kind: 'group', id: route.group_jid },
+    },
+  }));
+
+  const groups = {};
+  for (const route of routes) {
+    groups[route.group_jid] = {
+      requireMention: route.require_mention !== false,
+      systemPrompt: route.system_prompt || undefined,
+    };
+  }
+
+  const ownerPhones = [...new Set(routes.map((route) => route.owner_phone).filter(Boolean))];
+  const allowEveryone = routes.some((route) => route.group_scope === 'everyone');
+  const port = Number(account.gateway_port || existing.gateway?.port || (21000 + accountId * 20));
+  const token = existing.gateway?.auth?.token || crypto.randomBytes(24).toString('hex');
+
+  return {
+    ...existingConfig,
+    agents: {
+      defaults: {
+        ...(existing.agents?.defaults || {}),
+        model: existing.agents?.defaults?.model || {
+          primary: 'openai/gpt-5.5',
+          fallbacks: [],
+        },
+      },
+      list: agents,
+    },
+    bindings,
+    channels: {
+      whatsapp: {
+        enabled: true,
+        dmPolicy: 'disabled',
+        allowFrom: [],
+        groupPolicy: 'allowlist',
+        groupAllowFrom: allowEveryone ? ['*'] : ownerPhones,
+        groups,
+        debounceMs: 3000,
+        sendReadReceipts: false,
+      },
+    },
+    gateway: {
+      mode: 'local',
+      port,
+      bind: 'loopback',
+      auth: { mode: 'token', token },
+    },
+    session: { dmScope: 'per-channel-peer' },
+    tools: existing.tools || { profile: 'coding' },
+    plugins: {
+      allow: ['openai', 'whatsapp'],
+      bundledDiscovery: 'compat',
+      entries: {
+        openai: { enabled: true },
+        whatsapp: { enabled: true },
+      },
+    },
+  };
+}
+
+function installManagedNativeService(accountId, config) {
+  const paths = managedAccountPaths(accountId);
+  fs.mkdirSync(paths.base, { recursive: true });
+  fs.mkdirSync(paths.credsDir, { recursive: true });
+  fs.mkdirSync(paths.workspaceDir, { recursive: true });
+  fs.writeFileSync(paths.configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+
+  // Install through the official npm source so OpenClaw grants trusted plugin
+  // capabilities (required by WhatsApp's keyed credential store). A plain
+  // directory copy loads but remains untrusted and crashes the channel.
+  const trustedPluginPackage = path.join(
+    paths.base,
+    'npm/projects/openclaw-whatsapp-290d7f7427/node_modules/@openclaw/whatsapp/package.json',
+  );
+  if (!fs.existsSync(trustedPluginPackage)) {
+    execFileSync(NODE_BIN, [OPENCLAW_BIN, 'plugins', 'install', WHATSAPP_PLUGIN_SPEC], {
+      encoding: 'utf8',
+      timeout: 120000,
+      env: {
+        ...process.env,
+        HOME: '/root',
+        OPENCLAW_STATE_DIR: paths.base,
+        OPENCLAW_CONFIG_PATH: paths.configPath,
+        CODEX_HOME: '/root/.codex',
+      },
+    });
+  }
+
+  const unit = `[Unit]\nDescription=OpenClaw Managed WhatsApp Gateway #${accountId}\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=root\nWorkingDirectory=${paths.base}\nEnvironment=HOME=/root\nEnvironment=OPENCLAW_STATE_DIR=${paths.base}\nEnvironment=OPENCLAW_CONFIG_PATH=${paths.configPath}\nEnvironment=CODEX_HOME=/root/.codex\nExecStart=${NODE_BIN} ${OPENCLAW_BIN} gateway --port ${config.gateway.port}\nRestart=always\nRestartSec=5\nRestartPreventExitStatus=78\n\n[Install]\nWantedBy=multi-user.target\n`;
+  fs.writeFileSync(paths.serviceFile, unit);
+  run('systemctl daemon-reload');
 }
 
 app.get('/managed-router/:accountId/status', (req, res) => {
@@ -1055,11 +1238,26 @@ app.put('/managed-router/:accountId/routes', (req, res) => {
     return res.status(400).json({ ok: false, error: 'Invalid accountId' });
   }
   const routes = req.body?.routes;
+  const account = req.body?.account || {};
   if (!Array.isArray(routes)) {
     return res.status(400).json({ ok: false, error: 'routes array is required' });
   }
   writeManagedRoutes(accountId, routes);
-  res.json({ ok: true, success: true, route_count: routes.length });
+  try {
+    const config = buildManagedNativeConfig(accountId, routes, account);
+    installManagedNativeService(accountId, config);
+    const { serviceName } = managedAccountPaths(accountId);
+    let restarted = false;
+    try {
+      if (run(`systemctl is-active ${quote(serviceName)} 2>/dev/null; true`) === 'active') {
+        run(`systemctl restart ${quote(serviceName)}`);
+        restarted = true;
+      }
+    } catch {}
+    res.json({ ok: true, success: true, route_count: routes.length, routing_mode: 'native-bindings', restarted });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: 'Failed to compile native managed gateway', detail: error.message });
+  }
 });
 
 app.post('/managed-router/:accountId/routes', (req, res) => {
@@ -1095,9 +1293,76 @@ app.post('/managed-router/:accountId/reload', (req, res) => {
   if (!Number.isInteger(accountId) || accountId < 1) {
     return res.status(400).json({ ok: false, error: 'Invalid accountId' });
   }
-  // Routes are already persisted to file; actual gateway reload happens when
-  // the managed gateway process re-reads routes.json on next message dispatch.
-  res.json({ ok: true, success: true, message: 'Routes file updated; gateway will pick up on next dispatch' });
+  const { serviceName } = managedAccountPaths(accountId);
+  try {
+    const active = run(`systemctl is-active ${quote(serviceName)} 2>/dev/null; true`) === 'active';
+    if (active) run(`systemctl restart ${quote(serviceName)}`);
+    res.json({ ok: true, success: true, active, message: active ? 'Native gateway restarted' : 'Config ready; QR login is still required' });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/managed-router/:accountId/activate', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const { credsDir, serviceName } = managedAccountPaths(accountId);
+  if (!fs.existsSync(path.join(credsDir, 'creds.json'))) {
+    return res.status(422).json({ ok: false, error: 'WhatsApp belum login. Jalankan login QR terlebih dahulu.' });
+  }
+  try {
+    run(`systemctl enable ${quote(serviceName)}`);
+    run(`systemctl restart ${quote(serviceName)}`);
+    res.json({ ok: true, success: true, service_status: 'active' });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/managed-router/:accountId/login/start', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const current = managedLoginSessions.get(accountId);
+  if (current?.status === 'running') return res.json({ ok: true, status: 'running' });
+  const paths = managedAccountPaths(accountId);
+  if (!fs.existsSync(paths.configPath)) return res.status(422).json({ ok: false, error: 'Push managed routes terlebih dahulu.' });
+
+  const command = `${NODE_BIN} ${OPENCLAW_BIN} channels login --channel whatsapp`;
+  const child = spawn('/usr/bin/script', ['-qefc', command, '/dev/null'], {
+    env: { ...process.env, HOME: '/root', OPENCLAW_STATE_DIR: paths.base, OPENCLAW_CONFIG_PATH: paths.configPath, CODEX_HOME: '/root/.codex', TERM: 'xterm-256color' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const session = { status: 'running', output: '', started_at: new Date().toISOString(), exit_code: null };
+  managedLoginSessions.set(accountId, session);
+  const append = (chunk) => { session.output = (session.output + chunk.toString()).slice(-30000); };
+  child.stdout.on('data', append);
+  child.stderr.on('data', append);
+  child.on('error', (error) => { session.status = 'failed'; session.output += `\n${error.message}`; });
+  child.on('exit', (code) => {
+    session.exit_code = code;
+    session.status = fs.existsSync(path.join(paths.credsDir, 'creds.json')) ? 'connected' : (code === 0 ? 'finished' : 'failed');
+  });
+  setTimeout(() => {
+    if (session.status === 'running') { child.kill('SIGTERM'); session.status = 'timeout'; }
+  }, 180000);
+  res.json({ ok: true, status: 'running' });
+});
+
+app.get('/managed-router/:accountId/login/status', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const paths = managedAccountPaths(accountId);
+  const session = managedLoginSessions.get(accountId);
+  const connected = fs.existsSync(path.join(paths.credsDir, 'creds.json'));
+  const stripAnsi = (value) => String(value || '')
+    // OSC sequences (terminal title, hyperlinks, and similar payloads).
+    .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, '')
+    // CSI sequences (colors, cursor movement, erase-line, etc.).
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+    // Remaining two-byte escape sequences.
+    .replace(/\x1B[@-_]/g, '')
+    .replace(/\r/g, '');
+  res.json({ ok: true, status: connected ? 'connected' : (session?.status || 'idle'), connected, output: stripAnsi(session?.output || ''), started_at: session?.started_at || null, exit_code: session?.exit_code ?? null });
 });
 
 app.post('/managed-router/:accountId/create-group', (req, res) => {
@@ -1106,14 +1371,19 @@ app.post('/managed-router/:accountId/create-group', (req, res) => {
     return res.status(400).json({ ok: false, error: 'Invalid accountId' });
   }
 
-  const { group_name, participant_phone } = req.body;
+  const { group_name, participant_phone, idempotency_key } = req.body;
   if (!group_name) return res.status(400).json({ ok: false, error: 'group_name is required' });
   if (!participant_phone) return res.status(400).json({ ok: false, error: 'participant_phone is required' });
   if (!/^\+?[0-9]{8,15}$/.test(participant_phone.replace(/\s/g, ''))) {
     return res.status(400).json({ ok: false, error: 'participant_phone must be a valid phone number' });
   }
 
-  const { credsDir, serviceName } = managedAccountPaths(accountId);
+  const { base, credsDir, serviceName } = managedAccountPaths(accountId);
+  const groupRegistryFile = path.join(base, 'provisioned-groups.json');
+  const groupRegistry = readJsonFile(groupRegistryFile, {});
+  if (idempotency_key && groupRegistry[idempotency_key]) {
+    return res.json({ ok: true, success: true, ...groupRegistry[idempotency_key], reused: true });
+  }
   if (!fs.existsSync(path.join(credsDir, 'creds.json'))) {
     return res.status(400).json({
       ok: false,
@@ -1138,6 +1408,16 @@ app.post('/managed-router/:accountId/create-group', (req, res) => {
       }
 
       if (!result.ok) return res.status(500).json(result);
+
+      if (idempotency_key) {
+        fs.mkdirSync(base, { recursive: true });
+        groupRegistry[idempotency_key] = {
+          group_id: result.group_id,
+          invite_link: result.invite_link || null,
+          group_name,
+        };
+        fs.writeFileSync(groupRegistryFile, JSON.stringify(groupRegistry, null, 2) + '\n');
+      }
 
       sendTelegram(
         `✅ <b>Group WA Managed berhasil dibuat!</b>\n\n` +
