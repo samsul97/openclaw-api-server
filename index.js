@@ -120,6 +120,41 @@ function whatsappSessionIdentity(credsDir) {
   };
 }
 
+function configuredGatewayPorts(excludeManagedAccountId = null) {
+  const ports = new Map();
+  for (const name of discoverClients()) {
+    const port = Number(getClientConfig(name)?.gateway?.port || 0);
+    if (port) ports.set(port, `client:${name}`);
+  }
+
+  const managedRoot = '/root/.openclaw/managed-accounts';
+  if (fs.existsSync(managedRoot)) {
+    for (const entry of fs.readdirSync(managedRoot)) {
+      const id = Number(entry);
+      if (!Number.isInteger(id) || id === excludeManagedAccountId) continue;
+      const config = readJsonFile(path.join(managedRoot, entry, 'openclaw.json'), {});
+      const port = Number(config.gateway?.port || 0);
+      if (port) ports.set(port, `managed:${id}`);
+    }
+  }
+  return ports;
+}
+
+function resolveManagedGatewayPort(accountId, requestedPort, existingPort) {
+  const used = configuredGatewayPorts(accountId);
+  const persisted = Number(requestedPort || existingPort || 0);
+  if (persisted) {
+    const owner = used.get(persisted);
+    if (owner) throw new Error(`Gateway port ${persisted} already used by ${owner}`);
+    return persisted;
+  }
+
+  let candidate = 21000 + accountId * 20;
+  while (used.has(candidate) && candidate <= 65515) candidate += 20;
+  if (candidate > 65535) throw new Error('No managed gateway port available');
+  return candidate;
+}
+
 function runAsync(cmd, res, options = {}) {
   exec(cmd, { encoding: 'utf8', timeout: 120000, ...options }, (error, stdout, stderr) => {
     if (error) {
@@ -1158,7 +1193,7 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
 
   const ownerPhones = [...new Set(routes.map((route) => route.owner_phone).filter(Boolean))];
   const allowEveryone = routes.some((route) => route.group_scope === 'everyone');
-  const port = Number(account.gateway_port || existing.gateway?.port || (21000 + accountId * 20));
+  const port = resolveManagedGatewayPort(accountId, account.gateway_port, existing.gateway?.port);
   const token = existing.gateway?.auth?.token || crypto.randomBytes(24).toString('hex');
 
   return {
