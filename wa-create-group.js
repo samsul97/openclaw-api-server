@@ -88,6 +88,21 @@ async function main() {
             // invite link is optional
           }
 
+          let inviteSent = false;
+          let inviteSendError = null;
+          if (missingPhones.length > 0 && inviteLink) {
+            try {
+              for (const phone of missingPhones) {
+                await sock.sendMessage(phone, {
+                  text: `Anda diundang bergabung ke grup WhatsApp “${groupName}”.\n\n${inviteLink}\n\nBuka link lalu tekan Join Group.`,
+                });
+              }
+              inviteSent = true;
+            } catch (err) {
+              inviteSendError = err.message;
+            }
+          }
+
           clearTimeout(timeout);
           out({
             ok: true,
@@ -98,8 +113,12 @@ async function main() {
             participant_count: participantIds.length,
             group_id: groupId,
             invite_link: inviteLink,
+            invite_sent: inviteSent,
+            invite_send_error: inviteSendError,
             warning: missingPhones.length > 0
-              ? 'Group dibuat, tetapi member belum terverifikasi masuk. Gunakan link undangan.'
+              ? (inviteSent
+                  ? 'Group dibuat; link undangan sudah dikirim otomatis ke owner.'
+                  : 'Group dibuat, tetapi member belum terverifikasi masuk. Gunakan link undangan.')
               : null,
           });
           await sock.end();
