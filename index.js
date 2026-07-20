@@ -1152,6 +1152,11 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
     if (!route.client_name || !route.agent_workspace || !route.agent_dir) continue;
     if (!clients.has(route.client_name)) clients.set(route.client_name, route);
   }
+  const dmClients = Array.isArray(account.dm_clients) ? account.dm_clients : [];
+  for (const client of dmClients) {
+    if (!client.client_name || !client.agent_workspace || !client.agent_dir) continue;
+    if (!clients.has(client.client_name)) clients.set(client.client_name, client);
+  }
 
   const agents = [...clients.values()].map((route, index) => ({
     id: route.client_name,
@@ -1174,7 +1179,7 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
     });
   }
 
-  const bindings = routes.map((route) => ({
+  const groupBindings = routes.map((route) => ({
     agentId: route.client_name,
     comment: `Managed WA account ${accountId}, assistant slot ${route.assistant_slot || 1}`,
     match: {
@@ -1182,6 +1187,17 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
       peer: { kind: 'group', id: route.group_jid },
     },
   }));
+  const dmBindings = dmClients
+    .filter(client => client.client_name && client.owner_phone)
+    .map(client => ({
+      agentId: client.client_name,
+      comment: `Managed WA account ${accountId}, owner-only personal DM`,
+      match: {
+        channel: 'whatsapp',
+        peer: { kind: 'direct', id: client.owner_phone },
+      },
+    }));
+  const bindings = [...groupBindings, ...dmBindings];
 
   const groups = {};
   for (const route of routes) {
@@ -1191,7 +1207,10 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
     };
   }
 
-  const ownerPhones = [...new Set(routes.map((route) => route.owner_phone).filter(Boolean))];
+  const ownerPhones = [...new Set([
+    ...routes.map(route => route.owner_phone),
+    ...dmClients.map(client => client.owner_phone),
+  ].filter(Boolean))];
   const allowEveryone = routes.some((route) => route.group_scope === 'everyone');
   const port = resolveManagedGatewayPort(accountId, account.gateway_port, existing.gateway?.port);
   const token = existing.gateway?.auth?.token || crypto.randomBytes(24).toString('hex');
@@ -1212,8 +1231,8 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
     channels: {
       whatsapp: {
         enabled: true,
-        dmPolicy: 'disabled',
-        allowFrom: [],
+        dmPolicy: ownerPhones.length > 0 ? 'allowlist' : 'disabled',
+        allowFrom: ownerPhones,
         groupPolicy: 'allowlist',
         groupAllowFrom: allowEveryone ? ['*'] : ownerPhones,
         groups,
@@ -1566,6 +1585,26 @@ app.get('/managed-router/:accountId/group-invites', (req, res) => {
   }));
 
   res.json({ ok: true, groups });
+});
+
+app.delete('/managed-router/:accountId/clients/:clientId/registry', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  const clientId = parseInt(req.params.clientId);
+  if (!Number.isInteger(accountId) || accountId < 1 || !Number.isInteger(clientId) || clientId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId or clientId' });
+  }
+
+  const registryFile = path.join(managedAccountPaths(accountId).base, 'provisioned-groups.json');
+  const registry = readJsonFile(registryFile, {});
+  const prefix = `client:${clientId}:`;
+  let removed = 0;
+  for (const key of Object.keys(registry)) {
+    if (!key.startsWith(prefix)) continue;
+    delete registry[key];
+    removed += 1;
+  }
+  fs.writeFileSync(registryFile, JSON.stringify(registry, null, 2) + '\n');
+  res.json({ ok: true, removed });
 });
 
 app.post('/managed-router/:accountId/create-groups', (req, res) => {
