@@ -63,6 +63,23 @@ async function main() {
           const result = await sock.groupCreate(groupName, participantJIDs);
           const groupId = result.id;
 
+          let metadata = result;
+          try {
+            metadata = await sock.groupMetadata(groupId);
+          } catch {
+            // The creation response still contains participant information on
+            // most WhatsApp versions, so metadata refresh is best-effort.
+          }
+
+          const participantIds = (metadata?.participants || result?.participants || [])
+            .flatMap(participant => [participant?.id, participant?.phoneNumber])
+            .filter(Boolean);
+          const addedPhones = participantJIDs.filter(requested => {
+            const digits = requested.replace(/[^0-9]/g, '');
+            return participantIds.some(actual => String(actual).replace(/[^0-9]/g, '').startsWith(digits));
+          });
+          const missingPhones = participantJIDs.filter(phone => !addedPhones.includes(phone));
+
           let inviteLink = null;
           try {
             const code = await sock.groupInviteCode(groupId);
@@ -72,7 +89,19 @@ async function main() {
           }
 
           clearTimeout(timeout);
-          out({ ok: true, group_id: groupId, invite_link: inviteLink });
+          out({
+            ok: true,
+            partial_success: missingPhones.length > 0,
+            participant_added: missingPhones.length === 0,
+            requested_participants: participantJIDs,
+            missing_participants: missingPhones,
+            participant_count: participantIds.length,
+            group_id: groupId,
+            invite_link: inviteLink,
+            warning: missingPhones.length > 0
+              ? 'Group dibuat, tetapi member belum terverifikasi masuk. Gunakan link undangan.'
+              : null,
+          });
           await sock.end();
         } catch (err) {
           clearTimeout(timeout);

@@ -105,6 +105,21 @@ function readJsonFile(file, fallback) {
   }
 }
 
+function normalizePhone(value) {
+  return String(value || '').replace(/[^0-9]/g, '');
+}
+
+function whatsappSessionIdentity(credsDir) {
+  const creds = readJsonFile(path.join(credsDir, 'creds.json'), null);
+  const rawId = creds?.me?.id || '';
+  const phone = normalizePhone(rawId.split(':')[0].split('@')[0]);
+  return {
+    credentials_exist: Boolean(creds),
+    session_phone: phone ? `+${phone}` : null,
+    session_name: creds?.me?.name || null,
+  };
+}
+
 function runAsync(cmd, res, options = {}) {
   exec(cmd, { encoding: 'utf8', timeout: 120000, ...options }, (error, stdout, stderr) => {
     if (error) {
@@ -1020,6 +1035,10 @@ app.post('/clients/:name/groups/create', (req, res) => {
           group_id: result.group_id,
           invite_link: result.invite_link || null,
           group_name,
+          partial_success: Boolean(result.partial_success),
+          participant_added: result.participant_added !== false,
+          missing_participants: result.missing_participants || [],
+          warning: result.warning || null,
         };
         fs.writeFileSync(groupRegistryFile, JSON.stringify(groupRegistry, null, 2) + '\n');
       }
@@ -1225,11 +1244,26 @@ app.get('/managed-router/:accountId/status', (req, res) => {
     return res.status(400).json({ ok: false, error: 'Invalid accountId' });
   }
   const { credsDir, serviceName, routesFile } = managedAccountPaths(accountId);
-  const credsExist = fs.existsSync(path.join(credsDir, 'creds.json'));
+  const identity = whatsappSessionIdentity(credsDir);
+  const expectedPhone = normalizePhone(req.query.expected_phone);
+  const actualPhone = normalizePhone(identity.session_phone);
+  const phoneMatches = !expectedPhone || (Boolean(actualPhone) && actualPhone === expectedPhone);
   let serviceStatus = 'unknown';
   try { serviceStatus = run(`systemctl is-active ${quote(serviceName)} 2>/dev/null; true`); } catch { serviceStatus = 'inactive'; }
   const routes = readManagedRoutes(accountId);
-  res.json({ ok: true, account_id: accountId, wa_connected: credsExist, service_status: serviceStatus, route_count: routes.length });
+  const connected = identity.credentials_exist && serviceStatus === 'active' && phoneMatches;
+  res.json({
+    ok: true,
+    account_id: accountId,
+    wa_connected: connected,
+    credentials_exist: identity.credentials_exist,
+    session_phone: identity.session_phone,
+    session_name: identity.session_name,
+    expected_phone: expectedPhone ? `+${expectedPhone}` : null,
+    phone_matches: phoneMatches,
+    service_status: serviceStatus,
+    route_count: routes.length,
+  });
 });
 
 app.put('/managed-router/:accountId/routes', (req, res) => {
@@ -1326,13 +1360,21 @@ app.post('/managed-router/:accountId/login/start', (req, res) => {
   if (current?.status === 'running') return res.json({ ok: true, status: 'running' });
   const paths = managedAccountPaths(accountId);
   if (!fs.existsSync(paths.configPath)) return res.status(422).json({ ok: false, error: 'Push managed routes terlebih dahulu.' });
+  const identity = whatsappSessionIdentity(paths.credsDir);
+  if (identity.credentials_exist) {
+    return res.status(409).json({
+      ok: false,
+      error: 'Session WhatsApp sudah ada. Reset session terlebih dahulu jika ingin pair ulang.',
+      session_phone: identity.session_phone,
+    });
+  }
 
   const command = `${NODE_BIN} ${OPENCLAW_BIN} channels login --channel whatsapp`;
   const child = spawn('/usr/bin/script', ['-qefc', command, '/dev/null'], {
     env: { ...process.env, HOME: '/root', OPENCLAW_STATE_DIR: paths.base, OPENCLAW_CONFIG_PATH: paths.configPath, CODEX_HOME: '/root/.codex', TERM: 'xterm-256color' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const session = { status: 'running', output: '', started_at: new Date().toISOString(), exit_code: null };
+  const session = { status: 'running', output: '', started_at: new Date().toISOString(), exit_code: null, child };
   managedLoginSessions.set(accountId, session);
   const append = (chunk) => { session.output = (session.output + chunk.toString()).slice(-30000); };
   child.stdout.on('data', append);
@@ -1346,6 +1388,31 @@ app.post('/managed-router/:accountId/login/start', (req, res) => {
     if (session.status === 'running') { child.kill('SIGTERM'); session.status = 'timeout'; }
   }, 180000);
   res.json({ ok: true, status: 'running' });
+});
+
+app.post('/managed-router/:accountId/session/reset', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+
+  const paths = managedAccountPaths(accountId);
+  const session = managedLoginSessions.get(accountId);
+  if (session?.status === 'running' && session.child) {
+    session.child.kill('SIGTERM');
+    session.status = 'cancelled';
+  }
+
+  try { run(`systemctl stop ${quote(paths.serviceName)} 2>/dev/null || true`); } catch {}
+
+  const credsRoot = path.dirname(paths.credsDir);
+  let backup_path = null;
+  if (fs.existsSync(credsRoot)) {
+    backup_path = `${credsRoot}.backup-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    fs.renameSync(credsRoot, backup_path);
+  }
+  fs.mkdirSync(paths.credsDir, { recursive: true, mode: 0o700 });
+  managedLoginSessions.delete(accountId);
+
+  res.json({ ok: true, reset: true, backup_path, service_status: 'stopped' });
 });
 
 app.get('/managed-router/:accountId/login/status', (req, res) => {
@@ -1415,6 +1482,10 @@ app.post('/managed-router/:accountId/create-group', (req, res) => {
           group_id: result.group_id,
           invite_link: result.invite_link || null,
           group_name,
+          partial_success: Boolean(result.partial_success),
+          participant_added: result.participant_added !== false,
+          missing_participants: result.missing_participants || [],
+          warning: result.warning || null,
         };
         fs.writeFileSync(groupRegistryFile, JSON.stringify(groupRegistry, null, 2) + '\n');
       }
