@@ -1288,7 +1288,7 @@ app.put('/managed-router/:accountId/routes', (req, res) => {
         restarted = true;
       }
     } catch {}
-    res.json({ ok: true, success: true, route_count: routes.length, routing_mode: 'native-bindings', restarted });
+    res.json({ ok: true, success: true, route_count: routes.length, routing_mode: 'native-bindings', gateway_port: config.gateway.port, restarted });
   } catch (error) {
     res.status(500).json({ ok: false, error: 'Failed to compile native managed gateway', detail: error.message });
   }
