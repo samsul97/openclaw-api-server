@@ -1411,7 +1411,10 @@ app.post('/managed-router/:accountId/login/start', (req, res) => {
   });
   const session = { status: 'running', output: '', started_at: new Date().toISOString(), exit_code: null, child };
   managedLoginSessions.set(accountId, session);
-  const append = (chunk) => { session.output = (session.output + chunk.toString()).slice(-30000); };
+  // A WhatsApp QR rendered with ANSI background cells can exceed 30 KB.
+  // Keep enough terminal output for at least one complete OpenClaw QR; cutting
+  // through the matrix produces a wide, incomplete image that cannot be scanned.
+  const append = (chunk) => { session.output = (session.output + chunk.toString()).slice(-250000); };
   child.stdout.on('data', append);
   child.stderr.on('data', append);
   child.on('error', (error) => { session.status = 'failed'; session.output += `\n${error.message}`; });
