@@ -52,12 +52,10 @@ async function main() {
           clearTimeout(timeout);
           out({ ok: true, group_id: groupId, owner_jid: ownerJid, invite_sent: true });
           await sock.end();
-          process.exit(0);
         } catch (error) {
           clearTimeout(timeout);
           out({ ok: false, error: error.message });
           await sock.end();
-          process.exit(1);
         }
       } else if (connection === 'close' && lastDisconnect && !lastDisconnect.error) {
         clearTimeout(timeout);
