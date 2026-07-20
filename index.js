@@ -1,5 +1,5 @@
 const express = require('express');
-const { exec, execSync, execFileSync, spawn } = require('child_process');
+const { exec, execSync, execFile, execFileSync, spawn } = require('child_process');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
@@ -1546,6 +1546,114 @@ app.post('/managed-router/:accountId/create-group', (req, res) => {
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
+});
+
+app.get('/managed-router/:accountId/group-invites', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+
+  const registry = readJsonFile(path.join(managedAccountPaths(accountId).base, 'provisioned-groups.json'), {});
+  const groups = Object.entries(registry).map(([idempotencyKey, entry]) => ({
+    idempotency_key: idempotencyKey,
+    group_id: entry.group_id || null,
+    group_name: entry.group_name || null,
+    invite_link: entry.invite_link || null,
+    participant_added: entry.participant_added !== false,
+    partial_success: Boolean(entry.partial_success),
+    warning: entry.warning || null,
+  }));
+
+  res.json({ ok: true, groups });
+});
+
+app.post('/managed-router/:accountId/create-groups', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+
+  const requested = req.body?.groups;
+  if (!Array.isArray(requested) || requested.length < 1 || requested.length > 8) {
+    return res.status(400).json({ ok: false, error: 'groups must contain 1-8 entries' });
+  }
+  for (const group of requested) {
+    if (!group?.group_name || !group?.participant_phone || !group?.idempotency_key) {
+      return res.status(400).json({ ok: false, error: 'Each group requires group_name, participant_phone, and idempotency_key' });
+    }
+    if (!/^\+?[0-9]{8,15}$/.test(String(group.participant_phone).replace(/\s/g, ''))) {
+      return res.status(400).json({ ok: false, error: 'participant_phone must be a valid phone number' });
+    }
+  }
+
+  const { base, credsDir, serviceName } = managedAccountPaths(accountId);
+  if (!fs.existsSync(path.join(credsDir, 'creds.json'))) {
+    return res.status(400).json({ ok: false, error: 'Managed WhatsApp session is not paired' });
+  }
+
+  const registryFile = path.join(base, 'provisioned-groups.json');
+  const registry = readJsonFile(registryFile, {});
+  const reused = [];
+  const pending = [];
+  for (const group of requested) {
+    const existing = registry[group.idempotency_key];
+    if (existing) reused.push({ ...existing, idempotency_key: group.idempotency_key, reused: true });
+    else pending.push(group);
+  }
+  if (pending.length === 0) {
+    return res.json({ ok: true, success: true, groups: reused, reused_count: reused.length, created_count: 0 });
+  }
+
+  try { run(`systemctl stop ${quote(serviceName)} 2>/dev/null || true`); } catch {}
+  const scriptPath = path.join(__dirname, 'wa-create-groups.js');
+  execFile(process.execPath, [scriptPath, credsDir, JSON.stringify(pending)], {
+    encoding: 'utf8',
+    timeout: 180000,
+    maxBuffer: 1024 * 1024,
+  }, (error, stdout) => {
+    try { run(`systemctl start ${quote(serviceName)} 2>/dev/null || true`); } catch {}
+
+    let result;
+    try { result = JSON.parse(stdout.trim()); } catch {
+      return res.status(500).json({ ok: false, error: 'Failed to parse batch group output', raw: stdout.slice(0, 300) });
+    }
+    if (error || !result.ok) {
+      return res.status(500).json({ ok: false, error: result?.error || error?.message || 'Batch group creation failed', groups: result?.groups || [] });
+    }
+
+    for (const group of result.groups) {
+      const source = pending.find(item => item.idempotency_key === group.idempotency_key);
+      registry[group.idempotency_key] = {
+        group_id: group.group_id,
+        invite_link: group.invite_link || null,
+        group_name: source?.group_name || group.group_name,
+        partial_success: Boolean(group.partial_success),
+        participant_added: group.participant_added !== false,
+        missing_participants: group.missing_participants || [],
+        warning: group.warning || null,
+      };
+    }
+    fs.mkdirSync(base, { recursive: true });
+    fs.writeFileSync(registryFile, JSON.stringify(registry, null, 2) + '\n');
+
+    sendTelegram(
+      `✅ <b>${result.groups.length} Group WA Managed dibuat</b>\n\n` +
+      result.groups.map(group => {
+        const saved = registry[group.idempotency_key];
+        return `👥 <b>${saved.group_name}</b>\n🆔 <code>${saved.group_id}</code>` +
+          (saved.invite_link ? `\n🔗 <a href="${saved.invite_link}">Link Undangan</a>` : '');
+      }).join('\n\n')
+    );
+
+    res.json({
+      ok: true,
+      success: true,
+      groups: [...reused, ...result.groups],
+      reused_count: reused.length,
+      created_count: result.groups.length,
+    });
+  });
 });
 
 app.listen(PORT, HOST, () => {
