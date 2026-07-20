@@ -155,6 +155,39 @@ function resolveManagedGatewayPort(accountId, requestedPort, existingPort) {
   return candidate;
 }
 
+function terminalQrSvgDataUrl(value) {
+  const rows = [];
+  const rowPattern = /\x1B\[(40|47)m {2}\x1B\[0m/g;
+  for (const line of String(value || '').split(/\r?\n/)) {
+    const modules = [...line.matchAll(rowPattern)].map(match => match[1] === '40');
+    if (modules.length >= 20) rows.push(modules);
+  }
+  if (rows.length < 20) return null;
+
+  // The login process may print refreshed QR codes. OpenClaw's renderer emits
+  // square matrices, so use the last complete square block without changing
+  // any module values.
+  let matrix = null;
+  for (let end = rows.length; end >= 20; end -= 1) {
+    const width = rows[end - 1].length;
+    if (width < 20 || end < width) continue;
+    const candidate = rows.slice(end - width, end);
+    if (candidate.every(row => row.length === width)) {
+      matrix = candidate;
+      break;
+    }
+  }
+  if (!matrix) return null;
+
+  const size = matrix.length;
+  const rects = [];
+  matrix.forEach((row, y) => row.forEach((dark, x) => {
+    if (dark) rects.push(`<rect x="${x}" y="${y}" width="1" height="1"/>`);
+  }));
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="white"/><g fill="black">${rects.join('')}</g></svg>`;
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+}
+
 function runAsync(cmd, res, options = {}) {
   exec(cmd, { encoding: 'utf8', timeout: 120000, ...options }, (error, stdout, stderr) => {
     if (error) {
@@ -1469,7 +1502,15 @@ app.get('/managed-router/:accountId/login/status', (req, res) => {
     // Remaining two-byte escape sequences.
     .replace(/\x1B[@-_]/g, '')
     .replace(/\r/g, '');
-  res.json({ ok: true, status: connected ? 'connected' : (session?.status || 'idle'), connected, output: renderTerminalOutput(session?.output || ''), started_at: session?.started_at || null, exit_code: session?.exit_code ?? null });
+  res.json({
+    ok: true,
+    status: connected ? 'connected' : (session?.status || 'idle'),
+    connected,
+    output: renderTerminalOutput(session?.output || ''),
+    qr_data_url: terminalQrSvgDataUrl(session?.output || ''),
+    started_at: session?.started_at || null,
+    exit_code: session?.exit_code ?? null,
+  });
 });
 
 app.post('/managed-router/:accountId/create-group', (req, res) => {
