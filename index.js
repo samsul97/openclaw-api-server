@@ -630,7 +630,7 @@ app.delete('/clients/:name', (req, res) => {
   if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
   if (!getClientConfig(name)) return res.status(404).json({ ok: false, error: 'Client not found' });
 
-  const cmd = `echo ${quote(name)} | bash ${quote(path.join(SCRIPTS_DIR, 'delete-client.sh'))} ${quote(name)} 2>&1`;
+  const cmd = `echo ${quote(name)} | bash ${quote(path.join(__dirname, 'delete-client.sh'))} ${quote(name)} 2>&1`;
   runAsync(cmd, res);
 });
 
