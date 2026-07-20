@@ -1456,12 +1456,7 @@ app.get('/managed-router/:accountId/login/status', (req, res) => {
   const paths = managedAccountPaths(accountId);
   const session = managedLoginSessions.get(accountId);
   const connected = fs.existsSync(path.join(paths.credsDir, 'creds.json'));
-  const renderTerminalOutput = (value) => String(value || '')
-    // OpenClaw renders QR modules as two spaces with ANSI background colors.
-    // Convert them before removing ANSI so browsers receive a scannable,
-    // monochrome QR instead of blank lines.
-    .replace(/\x1B\[40m {2}\x1B\[0m/g, '██')
-    .replace(/\x1B\[47m {2}\x1B\[0m/g, '  ')
+  const stripAnsi = (value) => String(value || '')
     // OSC sequences (terminal title, hyperlinks, and similar payloads).
     .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, '')
     // CSI sequences (colors, cursor movement, erase-line, etc.).
@@ -1469,7 +1464,7 @@ app.get('/managed-router/:accountId/login/status', (req, res) => {
     // Remaining two-byte escape sequences.
     .replace(/\x1B[@-_]/g, '')
     .replace(/\r/g, '');
-  res.json({ ok: true, status: connected ? 'connected' : (session?.status || 'idle'), connected, output: renderTerminalOutput(session?.output || ''), started_at: session?.started_at || null, exit_code: session?.exit_code ?? null });
+  res.json({ ok: true, status: connected ? 'connected' : (session?.status || 'idle'), connected, output: stripAnsi(session?.output || ''), started_at: session?.started_at || null, exit_code: session?.exit_code ?? null });
 });
 
 app.post('/managed-router/:accountId/create-group', (req, res) => {
