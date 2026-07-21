@@ -16,7 +16,15 @@ const NODE_BIN = '/root/.nvm/versions/node/v22.22.0/bin/node';
 const OPENCLAW_BIN = '/root/.nvm/versions/node/v22.22.0/lib/node_modules/openclaw/dist/index.js';
 const CLAUDE_BIN = '/root/.nvm/versions/node/v22.22.0/bin/claude';
 const WHATSAPP_PLUGIN_SPEC = '@openclaw/whatsapp@2026.5.27';
+const MODEL_POOL_SCRIPT = path.join(__dirname, 'chatgpt-pool-store.py');
 const managedLoginSessions = new Map();
+const modelPoolLoginSessions = new Map();
+const modelPoolSyncJobs = new Map();
+const modelPoolClientsInFlight = new Set();
+const MODEL_POOL_HEALTH_STATE_FILE = '/root/.openclaw/model-pool-health.json';
+const modelPoolHealthChecks = new Map(
+  Object.entries(readJsonFile(MODEL_POOL_HEALTH_STATE_FILE, {})).map(([id, state]) => [Number(id), state]),
+);
 const MANAGED_RUNTIME_STATE_FILE = '/root/.openclaw/managed-runtime-health.json';
 const managedRuntimeChecks = new Map(
   Object.entries(readJsonFile(MANAGED_RUNTIME_STATE_FILE, {})).map(([id, state]) => [Number(id), state]),
@@ -122,6 +130,167 @@ function whatsappSessionIdentity(credsDir) {
     session_phone: phone ? `+${phone}` : null,
     session_name: creds?.me?.name || null,
   };
+}
+
+function modelPoolPaths(accountId) {
+  const base = path.join('/root/.openclaw/model-pool', String(accountId));
+  return {
+    base,
+    stateDir: base,
+    configPath: path.join(base, 'openclaw.json'),
+    workspaceDir: path.join(base, 'workspace'),
+    codexHome: path.join(base, '.codex'),
+    sqlitePath: path.join(base, 'agents/main/agent/openclaw-agent.sqlite'),
+    jobsDir: path.join(base, 'sync-jobs'),
+    backupsDir: path.join(base, 'auth-backups'),
+  };
+}
+
+function ensureModelPool(accountId) {
+  const paths = modelPoolPaths(accountId);
+  for (const dir of [paths.base, paths.workspaceDir, paths.codexHome, paths.jobsDir, paths.backupsDir]) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+  if (!fs.existsSync(paths.configPath)) {
+    fs.writeFileSync(paths.configPath, JSON.stringify({
+      agents: { defaults: { workspace: paths.workspaceDir, model: { primary: 'openai/gpt-5.5', fallbacks: [] }, models: { 'openai/gpt-5.5': {} } } },
+      plugins: { allow: ['openai'], bundledDiscovery: 'compat', entries: { openai: { enabled: true } } },
+    }, null, 2) + '\n', { mode: 0o600 });
+  }
+  return paths;
+}
+
+function modelPoolEnv(paths) {
+  return { ...process.env, HOME: '/root', OPENCLAW_STATE_DIR: paths.stateDir, OPENCLAW_CONFIG_PATH: paths.configPath, CODEX_HOME: paths.codexHome, TERM: 'xterm-256color' };
+}
+
+function readModelPoolProfiles(accountId) {
+  const paths = ensureModelPool(accountId);
+  if (!fs.existsSync(paths.sqlitePath)) return [];
+  try {
+    const raw = execFileSync('python3', [MODEL_POOL_SCRIPT, 'list', '--db', paths.sqlitePath], { encoding: 'utf8', timeout: 10000 });
+    return JSON.parse(raw).profiles || [];
+  } catch {
+    return [];
+  }
+}
+
+function checkModelPoolHealth(accountId, profiles = readModelPoolProfiles(accountId)) {
+  if (!profiles.length) return { checked: true, ok: false, status: 'not_logged', error_category: null };
+  const paths = ensureModelPool(accountId);
+  try {
+    execFileSync(NODE_BIN, [OPENCLAW_BIN, 'models', 'status', '--check', '--json'], {
+      encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024, env: modelPoolEnv(paths),
+    });
+    return { checked: true, ok: true, status: 'active', error_category: null };
+  } catch (error) {
+    const detail = String(error.stderr || error.stdout || error.message || '');
+    const category = /invalid_refresh|authentication|unauthorized|expired/i.test(detail)
+      ? 'model_auth_expired'
+      : (/rate.?limit/i.test(detail) ? 'model_rate_limit' : 'model_check_failed');
+    return { checked: true, ok: false, status: 'expired', error_category: category };
+  }
+}
+
+async function monitorModelPools() {
+  const root = '/root/.openclaw/model-pool';
+  if (!fs.existsSync(root)) return;
+  for (const entry of fs.readdirSync(root)) {
+    const accountId = Number(entry);
+    if (!Number.isInteger(accountId)) continue;
+    const profiles = readModelPoolProfiles(accountId);
+    if (!profiles.length) continue;
+    const health = checkModelPoolHealth(accountId, profiles);
+    const previous = modelPoolHealthChecks.get(accountId);
+    modelPoolHealthChecks.set(accountId, { ok: health.ok, error_category: health.error_category });
+    if ((!health.ok && previous?.ok !== false) || (!health.ok && previous?.error_category !== health.error_category)) {
+      sendTelegram(`⚠️ <b>ChatGPT Pool #${accountId} bermasalah</b>\nPenyebab: <code>${health.error_category || 'unknown'}</code>\nClient yang memakai pool ini mungkin gagal membalas.`);
+    } else if (health.ok && previous?.ok === false) {
+      sendTelegram(`✅ <b>ChatGPT Pool #${accountId} pulih</b>\nModel auth kembali valid.`);
+    }
+  }
+  fs.writeFileSync(MODEL_POOL_HEALTH_STATE_FILE, JSON.stringify(Object.fromEntries(modelPoolHealthChecks), null, 2) + '\n', { mode: 0o600 });
+}
+
+function sanitizeTerminalOutput(value) {
+  return String(value || '')
+    .replace(/(access|refresh|token|secret)[=:]\s*[^\s]+/gi, '$1=<redacted>')
+    .replace(/([?&]code=)[^&\s]+/gi, '$1<redacted>')
+    .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, '')
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1B[@-_]/g, '')
+    .replace(/\r/g, '');
+}
+
+function writeModelPoolJob(paths, job) {
+  const safe = { ...job };
+  delete safe.promise;
+  fs.writeFileSync(path.join(paths.jobsDir, `${job.id}.json`), JSON.stringify(safe, null, 2) + '\n', { mode: 0o600 });
+}
+
+function recoverInterruptedModelPoolJobs() {
+  const root = '/root/.openclaw/model-pool';
+  if (!fs.existsSync(root)) return;
+  for (const entry of fs.readdirSync(root)) {
+    const accountId = Number(entry);
+    if (!Number.isInteger(accountId)) continue;
+    const paths = modelPoolPaths(accountId);
+    if (!fs.existsSync(paths.jobsDir)) continue;
+    for (const file of fs.readdirSync(paths.jobsDir).filter(name => /^[0-9a-f-]{36}\.json$/i.test(name))) {
+      const target = path.join(paths.jobsDir, file);
+      const job = readJsonFile(target, null);
+      if (!job || job.status !== 'running') continue;
+      job.status = 'failed';
+      job.finished_at = new Date().toISOString();
+      job.error = 'VPS API restarted before this job completed; retry failed clients.';
+      fs.writeFileSync(target, JSON.stringify(job, null, 2) + '\n', { mode: 0o600 });
+    }
+  }
+}
+
+async function syncModelPoolClient(accountId, profileId, clientName, replaceExisting) {
+  if (!validName(clientName)) return { client: clientName, ok: false, error: 'Invalid client name' };
+  if (!getClientConfig(clientName)) return { client: clientName, ok: false, error: 'Client not found or deleted' };
+  if (modelPoolClientsInFlight.has(clientName)) return { client: clientName, ok: false, error: 'Client is already being synced by another model-pool job' };
+  modelPoolClientsInFlight.add(clientName);
+  const source = ensureModelPool(accountId);
+  const target = clientPaths(clientName);
+  const sqlitePath = path.join(target.stateDir, 'agents/main/agent/openclaw-agent.sqlite');
+  const scope = target.serviceScope === 'system' ? '' : '--user ';
+  try {
+    try { run(`systemctl ${scope}stop ${quote(target.serviceName)} 2>/dev/null || true`); } catch {}
+    const args = [MODEL_POOL_SCRIPT, 'sync', '--source', source.sqlitePath, '--target', sqlitePath, '--profile-id', profileId];
+    if (replaceExisting) args.push('--replace');
+    const raw = execFileSync('python3', args, { encoding: 'utf8', timeout: 30000 });
+    const result = JSON.parse(raw);
+    if (!result.ok) throw new Error(result.error || 'Profile sync failed');
+    chownTreeIfHome(target, path.dirname(sqlitePath));
+    try { run(`systemctl ${scope}start ${quote(target.serviceName)}`); } catch {}
+    let modelAuthOk = false;
+    let verifyError = null;
+    try {
+      execFileSync(NODE_BIN, [OPENCLAW_BIN, 'models', 'status', '--check', '--json'], {
+        encoding: 'utf8', timeout: 60000, env: openClawEnv(target),
+      });
+      modelAuthOk = true;
+    } catch (error) {
+      verifyError = String(error.stderr || error.stdout || error.message || '').trim().slice(0, 1000);
+    }
+    return {
+      ...result,
+      client: clientName,
+      ok: modelAuthOk,
+      synced: true,
+      model_auth_ok: modelAuthOk,
+      service_status: getServiceStatus(clientName),
+      ...(modelAuthOk ? {} : { error: `Profile copied but model verification failed: ${verifyError}` }),
+    };
+  } catch (error) {
+    try { run(`systemctl ${scope}start ${quote(target.serviceName)} 2>/dev/null || true`); } catch {}
+    return { client: clientName, ok: false, error: String(error.stderr || error.message || '').trim().slice(0, 1000) };
+  } finally {
+    modelPoolClientsInFlight.delete(clientName);
+  }
 }
 
 function classifyWhatsAppError(value) {
@@ -1831,8 +2000,185 @@ app.post('/managed-router/:accountId/create-groups', (req, res) => {
   });
 });
 
+// ── ChatGPT Model Pool ─────────────────────────────────────────────────────
+
+app.get('/model-pool/:accountId/status', (req, res) => {
+  const accountId = Number(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const profiles = readModelPoolProfiles(accountId);
+  const health = checkModelPoolHealth(accountId, profiles);
+  res.json({
+    ok: true,
+    account_id: accountId,
+    auth_status: health.status,
+    health,
+    profiles,
+    login_status: modelPoolLoginSessions.get(accountId)?.status || 'idle',
+  });
+});
+
+app.post('/model-pool/:accountId/login/start', (req, res) => {
+  const accountId = Number(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const current = modelPoolLoginSessions.get(accountId);
+  if (current?.status === 'running') return res.json({ ok: true, status: 'running' });
+  const paths = ensureModelPool(accountId);
+  let backup = null;
+  if (req.body?.force === true && fs.existsSync(paths.sqlitePath)) {
+    try {
+      backup = JSON.parse(execFileSync('python3', [MODEL_POOL_SCRIPT, 'backup', '--db', paths.sqlitePath, '--backup-dir', paths.backupsDir], { encoding: 'utf8', timeout: 30000 }));
+    } catch (error) {
+      return res.status(500).json({ ok: false, error: 'Pool backup failed; reconnect was not started', detail: String(error.stderr || error.message || '').slice(0, 500) });
+    }
+  }
+  const args = [OPENCLAW_BIN, 'models', 'auth', 'login', '--provider', 'openai'];
+  if (req.body?.force === true) args.push('--force');
+  const command = [NODE_BIN, ...args].map(quote).join(' ');
+  const child = spawn('/usr/bin/script', ['-qefc', command, '/dev/null'], {
+    env: modelPoolEnv(paths),
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const session = { status: 'running', output: '', started_at: new Date().toISOString(), exit_code: null, child };
+  modelPoolLoginSessions.set(accountId, session);
+  const append = chunk => { session.output = (session.output + chunk.toString()).slice(-250000); };
+  child.stdout.on('data', append);
+  child.stderr.on('data', append);
+  child.on('error', error => { session.status = 'failed'; session.output += `\n${error.message}`; });
+  child.on('exit', code => {
+    session.exit_code = code;
+    const activeProfile = readModelPoolProfiles(accountId).some(profile => !profile.expired);
+    session.status = code === 0 && activeProfile ? 'connected' : (code === 0 ? 'finished' : 'failed');
+    delete session.child;
+  });
+  setTimeout(() => {
+    if (session.status === 'running') { session.child?.kill('SIGTERM'); session.status = 'timeout'; }
+  }, 300000);
+  res.json({ ok: true, status: 'running', backup: backup?.backup_name || null });
+});
+
+app.post('/model-pool/:accountId/login/input', (req, res) => {
+  const accountId = Number(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const session = modelPoolLoginSessions.get(accountId);
+  if (!session?.child || session.status !== 'running') return res.status(409).json({ ok: false, error: 'No active login session' });
+  const input = String(req.body?.input || '');
+  if (!input || input.length > 4096) return res.status(422).json({ ok: false, error: 'Input must contain 1-4096 characters' });
+  session.child.stdin.write(`${input}\n`);
+  res.json({ ok: true, accepted: true });
+});
+
+app.get('/model-pool/:accountId/login/status', (req, res) => {
+  const accountId = Number(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const session = modelPoolLoginSessions.get(accountId);
+  const profiles = readModelPoolProfiles(accountId);
+  res.json({
+    ok: true,
+    status: session?.status || (profiles.some(profile => !profile.expired) ? 'connected' : 'idle'),
+    output: sanitizeTerminalOutput(session?.output || ''),
+    profiles,
+    started_at: session?.started_at || null,
+    exit_code: session?.exit_code ?? null,
+  });
+});
+
+app.post('/model-pool/:accountId/login/cancel', (req, res) => {
+  const accountId = Number(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const session = modelPoolLoginSessions.get(accountId);
+  if (session?.child && session.status === 'running') session.child.kill('SIGTERM');
+  if (session) session.status = 'cancelled';
+  res.json({ ok: true, status: session?.status || 'idle' });
+});
+
+app.post('/model-pool/:accountId/sync', (req, res) => {
+  const accountId = Number(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const profileId = String(req.body?.profile_id || '');
+  const clients = [...new Set(Array.isArray(req.body?.clients) ? req.body.clients.map(String) : [])];
+  if (!profileId.startsWith('openai:')) return res.status(422).json({ ok: false, error: 'A valid OpenAI profile_id is required' });
+  if (clients.length < 1 || clients.length > 20) return res.status(422).json({ ok: false, error: 'Select 1-20 clients' });
+  if (!readModelPoolProfiles(accountId).some(profile => profile.profile_id === profileId && !profile.expired)) {
+    return res.status(422).json({ ok: false, error: 'Selected pool profile is missing or expired' });
+  }
+  if (modelPoolLoginSessions.get(accountId)?.status === 'running') {
+    return res.status(409).json({ ok: false, error: 'Finish or cancel the pool login before syncing clients' });
+  }
+  if ([...modelPoolSyncJobs.values()].some(job => job.account_id === accountId && job.status === 'running')) {
+    return res.status(409).json({ ok: false, error: 'Another sync job is already running for this pool' });
+  }
+  const paths = ensureModelPool(accountId);
+  const job = {
+    id: crypto.randomUUID(), account_id: accountId, profile_id: profileId,
+    clients, replace_existing: req.body?.replace_existing !== false,
+    status: 'running', results: [], started_at: new Date().toISOString(), finished_at: null,
+  };
+  modelPoolSyncJobs.set(job.id, job);
+  writeModelPoolJob(paths, job);
+  job.promise = (async () => {
+    for (const client of clients) {
+      job.results.push(await syncModelPoolClient(accountId, profileId, client, job.replace_existing));
+      writeModelPoolJob(paths, job);
+    }
+    job.status = job.results.every(result => result.ok) ? 'completed' : (job.results.some(result => result.ok) ? 'partial' : 'failed');
+    job.finished_at = new Date().toISOString();
+    writeModelPoolJob(paths, job);
+    sendTelegram(`🤖 <b>ChatGPT Pool sync ${job.status}</b>\nPool: <code>#${accountId}</code>\nSuccess: ${job.results.filter(item => item.ok).length}/${job.results.length}`);
+  })();
+  res.status(202).json({ ok: true, job_id: job.id, status: job.status });
+});
+
+app.get('/model-pool/:accountId/sync/:jobId', (req, res) => {
+  const accountId = Number(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  if (!/^[0-9a-f-]{36}$/i.test(req.params.jobId)) return res.status(400).json({ ok: false, error: 'Invalid jobId' });
+  const paths = ensureModelPool(accountId);
+  const memory = modelPoolSyncJobs.get(req.params.jobId);
+  const persisted = readJsonFile(path.join(paths.jobsDir, `${req.params.jobId}.json`), null);
+  const job = memory || persisted;
+  if (!job || job.account_id !== accountId) return res.status(404).json({ ok: false, error: 'Sync job not found' });
+  const safe = { ...job };
+  delete safe.promise;
+  res.json({ ok: true, job: safe });
+});
+
+app.get('/model-pool/:accountId/backups', (req, res) => {
+  const accountId = Number(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const paths = ensureModelPool(accountId);
+  const backups = fs.readdirSync(paths.backupsDir)
+    .filter(name => /^pool-auth-[0-9]+\.sqlite$/.test(name))
+    .map(name => ({ name, created_at: fs.statSync(path.join(paths.backupsDir, name)).mtime.toISOString() }))
+    .sort((a, b) => b.created_at.localeCompare(a.created_at));
+  res.json({ ok: true, backups });
+});
+
+app.post('/model-pool/:accountId/backups/:backupName/restore', (req, res) => {
+  const accountId = Number(req.params.accountId);
+  const backupName = String(req.params.backupName || '');
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  if (!/^pool-auth-[0-9]+\.sqlite$/.test(backupName)) return res.status(400).json({ ok: false, error: 'Invalid backup name' });
+  if (modelPoolLoginSessions.get(accountId)?.status === 'running') return res.status(409).json({ ok: false, error: 'Cancel login before restoring a backup' });
+  const paths = ensureModelPool(accountId);
+  const backupPath = path.join(paths.backupsDir, backupName);
+  if (!fs.existsSync(backupPath)) return res.status(404).json({ ok: false, error: 'Backup not found' });
+  try {
+    let safetyBackup = null;
+    if (fs.existsSync(paths.sqlitePath)) {
+      safetyBackup = JSON.parse(execFileSync('python3', [MODEL_POOL_SCRIPT, 'backup', '--db', paths.sqlitePath, '--backup-dir', paths.backupsDir], { encoding: 'utf8', timeout: 30000 }));
+    }
+    const restored = JSON.parse(execFileSync('python3', [MODEL_POOL_SCRIPT, 'restore', '--backup', backupPath, '--target', paths.sqlitePath], { encoding: 'utf8', timeout: 30000 }));
+    res.json({ ok: true, restored: restored.restored, safety_backup: safetyBackup?.backup_name || null, profiles: readModelPoolProfiles(accountId) });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: 'Pool restore failed', detail: String(error.stderr || error.message || '').slice(0, 500) });
+  }
+});
+
 app.listen(PORT, HOST, () => {
   console.log(`OpenClaw API Server running on ${HOST}:${PORT}`);
+  recoverInterruptedModelPoolJobs();
   setTimeout(() => monitorManagedWhatsApp().catch(() => {}), 5000);
   setInterval(() => monitorManagedWhatsApp().catch(() => {}), 60000);
+  setTimeout(() => monitorModelPools().catch(() => {}), 15000);
+  setInterval(() => monitorModelPools().catch(() => {}), 300000);
 });
