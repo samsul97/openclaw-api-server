@@ -1,7 +1,9 @@
 const express = require('express');
-const { exec, execSync } = require('child_process');
+const { exec, execSync, execFile, execFileSync, spawn } = require('child_process');
+const https = require('https');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -10,6 +12,31 @@ const PORT = 18799;
 const HOST = '127.0.0.1';
 const API_TOKEN = process.env.OPENCLAW_API_TOKEN || 'changeme-set-env-var';
 const SCRIPTS_DIR = '/root';
+const NODE_BIN = '/root/.nvm/versions/node/v22.22.0/bin/node';
+const OPENCLAW_BIN = '/root/.nvm/versions/node/v22.22.0/lib/node_modules/openclaw/dist/index.js';
+const CLAUDE_BIN = '/root/.nvm/versions/node/v22.22.0/bin/claude';
+const WHATSAPP_PLUGIN_SPEC = '@openclaw/whatsapp@2026.5.27';
+const managedLoginSessions = new Map();
+const MANAGED_RUNTIME_STATE_FILE = '/root/.openclaw/managed-runtime-health.json';
+const managedRuntimeChecks = new Map(
+  Object.entries(readJsonFile(MANAGED_RUNTIME_STATE_FILE, {})).map(([id, state]) => [Number(id), state]),
+);
+
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8731741557:AAFjdZjoXrcCdZPTHiJFjCjuo2ZRtOYP8YE';
+const TELEGRAM_CHAT  = process.env.TELEGRAM_CHAT_ID  || '652689793';
+
+function sendTelegram(text) {
+  const body = JSON.stringify({ chat_id: TELEGRAM_CHAT, text, parse_mode: 'HTML' });
+  const req = https.request({
+    hostname: 'api.telegram.org',
+    path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+  });
+  req.on('error', () => {});
+  req.write(body);
+  req.end();
+}
 
 const WORKSPACE_FILES = new Set([
   'SOUL.md',
@@ -19,6 +46,11 @@ const WORKSPACE_FILES = new Set([
   'IDENTITY.md',
   'HEARTBEAT.md',
 ]);
+
+const VALID_ASSISTANT_TYPES = [
+  'finance', 'health', 'admin', 'career', 'religious',
+  'parenting', 'kitchen', 'vehicle', 'creator', 'affiliate', 'coding', 'custom',
+];
 
 // Accepts root-level WORKSPACE_FILES and one-level subfolder paths like keuangan/AGENTS.md
 function isAllowedWorkspaceFile(file) {
@@ -34,8 +66,199 @@ function isAllowedWorkspaceFile(file) {
   return true;
 }
 
+function openClawEnv(paths) {
+  return {
+    ...process.env,
+    OPENCLAW_STATE_DIR: paths.stateDir,
+    OPENCLAW_CONFIG_PATH: paths.configPath,
+    CODEX_HOME: paths.codexHome,
+    HOME: paths.home,
+  };
+}
+
 function run(cmd, options = {}) {
   return execSync(cmd, { encoding: 'utf8', timeout: 60000, ...options }).trim();
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function execOpenClawAfterGatewayReady(args, options = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= 8; attempt += 1) {
+    try {
+      return execFileSync(NODE_BIN, [OPENCLAW_BIN, ...args], options);
+    } catch (error) {
+      lastError = error;
+      const detail = String(error.stderr || error.message || '');
+      const transient = /1006|ECONNREFUSED|not yet ready|closed before connect/i.test(detail);
+      if (!transient || attempt === 8) throw error;
+      sleepSync(2000);
+    }
+  }
+  throw lastError;
+}
+
+function readJsonFile(file, fallback) {
+  if (!fs.existsSync(file)) return fallback;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizePhone(value) {
+  return String(value || '').replace(/[^0-9]/g, '');
+}
+
+function whatsappSessionIdentity(credsDir) {
+  const creds = readJsonFile(path.join(credsDir, 'creds.json'), null);
+  const rawId = creds?.me?.id || '';
+  const phone = normalizePhone(rawId.split(':')[0].split('@')[0]);
+  return {
+    credentials_exist: Boolean(creds),
+    session_phone: phone ? `+${phone}` : null,
+    session_name: creds?.me?.name || null,
+  };
+}
+
+function classifyWhatsAppError(value) {
+  const error = String(value || '');
+  if (/401|unauthorized|logged out/i.test(error)) return 'auth_logged_out';
+  if (/timed?out|ETIMEDOUT/i.test(error)) return 'network_timeout';
+  if (/ECONN|ENOTFOUND|network/i.test(error)) return 'network_error';
+  return error ? 'channel_error' : null;
+}
+
+function persistManagedRuntimeChecks() {
+  fs.mkdirSync(path.dirname(MANAGED_RUNTIME_STATE_FILE), { recursive: true });
+  fs.writeFileSync(MANAGED_RUNTIME_STATE_FILE, JSON.stringify(Object.fromEntries(managedRuntimeChecks), null, 2) + '\n');
+}
+
+function getManagedChannelRuntime(accountId) {
+  const paths = managedAccountPaths(accountId);
+  const config = readJsonFile(paths.configPath, {});
+  const port = Number(config.gateway?.port || 0);
+  const token = config.gateway?.auth?.token;
+  if (!port || !token) {
+    return Promise.resolve({ checked: false, connected: false, running: false, health_state: 'not-configured', error_category: 'gateway_not_configured' });
+  }
+
+  return new Promise(resolve => {
+    execFile(NODE_BIN, [OPENCLAW_BIN, 'channels', 'status', '--json', '--url', `ws://127.0.0.1:${port}`, '--token', token], {
+      encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, HOME: '/root', OPENCLAW_STATE_DIR: paths.base, OPENCLAW_CONFIG_PATH: paths.configPath, CODEX_HOME: '/root/.codex' },
+    }, (error, stdout) => {
+      let parsed = {};
+      try { parsed = JSON.parse(String(stdout || '').trim()); } catch {}
+      const channel = parsed.channels?.whatsapp || parsed.channelAccounts?.whatsapp?.[0] || {};
+      let lastError = channel.lastError || parsed.error || error?.message || null;
+      if (channel.connected !== true && !lastError) {
+        try {
+          const logs = run(`journalctl -u ${quote(paths.serviceName)} --since '-15 minutes' --no-pager -n 120 2>/dev/null; true`, { timeout: 10000 });
+          lastError = logs.split('\n').filter(line => /401|unauthorized|logged out|connection failure|ETIMEDOUT|ECONN/i.test(line)).at(-1) || null;
+        } catch {}
+      }
+      resolve({
+        checked: true,
+        connected: channel.connected === true,
+        running: channel.running === true,
+        linked: channel.linked === true || channel.statusState === 'linked',
+        health_state: channel.healthState || (channel.connected ? 'healthy' : 'disconnected'),
+        last_connected_at: channel.lastConnectedAt || null,
+        last_inbound_at: channel.lastInboundAt || null,
+        last_message_at: channel.lastMessageAt || null,
+        error_category: classifyWhatsAppError(lastError),
+        last_error: lastError ? String(lastError).slice(0, 500) : null,
+      });
+    });
+  });
+}
+
+function getManagedModelRuntime(serviceName) {
+  let logs = '';
+  try {
+    logs = run(`journalctl -u ${quote(serviceName)} --since '-15 minutes' --no-pager -n 160 2>/dev/null; true`, { timeout: 10000 });
+  } catch {}
+  const lines = logs.split('\n').filter(line => /invalid_refresh|authentication_error|all models failed|provider auth|rate.?limit|model.*error/i.test(line));
+  const lastError = lines.at(-1) || null;
+  let errorCategory = null;
+  if (/invalid_refresh|authentication_error|provider auth/i.test(lastError || '')) errorCategory = 'model_auth_error';
+  else if (/rate.?limit/i.test(lastError || '')) errorCategory = 'model_rate_limit';
+  else if (/all models failed|model.*error/i.test(lastError || '')) errorCategory = 'model_runtime_error';
+  return {
+    checked: true,
+    status: errorCategory ? 'error' : 'no_recent_error',
+    error_category: errorCategory,
+    last_error: lastError ? lastError.slice(0, 500) : null,
+    window_minutes: 15,
+  };
+}
+
+async function monitorManagedWhatsApp() {
+  const managedRoot = '/root/.openclaw/managed-accounts';
+  if (!fs.existsSync(managedRoot)) return;
+  for (const entry of fs.readdirSync(managedRoot)) {
+    const accountId = Number(entry);
+    if (!Number.isInteger(accountId)) continue;
+    const paths = managedAccountPaths(accountId);
+    const identity = whatsappSessionIdentity(paths.credsDir);
+    if (!identity.credentials_exist) continue;
+    const runtime = await getManagedChannelRuntime(accountId);
+    const model = getManagedModelRuntime(paths.serviceName);
+    const previous = managedRuntimeChecks.get(accountId);
+    managedRuntimeChecks.set(accountId, { connected: runtime.connected, model_error: model.error_category });
+    persistManagedRuntimeChecks();
+    if (previous === undefined && !runtime.connected) {
+      sendTelegram(`🚨 <b>Managed WhatsApp #${accountId} terputus</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nStatus: <code>${runtime.health_state}</code>\nPenyebab: <code>${runtime.error_category || 'unknown'}</code>\nBuka Managed WA Account, lepas session, lalu pair ulang bila status menunjukkan auth_logged_out.`);
+    } else if (previous?.connected === true && !runtime.connected) {
+      sendTelegram(`🚨 <b>Managed WhatsApp #${accountId} baru saja terputus</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nPenyebab: <code>${runtime.error_category || 'unknown'}</code>`);
+    } else if (previous?.connected === false && runtime.connected) {
+      sendTelegram(`✅ <b>Managed WhatsApp #${accountId} pulih</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nChannel kembali connected.`);
+    }
+    if (model.error_category && previous?.model_error !== model.error_category) {
+      sendTelegram(`⚠️ <b>Model/provider error pada managed bot #${accountId}</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nPenyebab: <code>${model.error_category}</code>\nWhatsApp: <code>${runtime.connected ? 'connected' : 'disconnected'}</code>`);
+    } else if (!model.error_category && previous?.model_error) {
+      sendTelegram(`✅ <b>Model/provider managed bot #${accountId} pulih</b>\nTidak ada error baru dalam 15 menit terakhir.`);
+    }
+  }
+}
+
+function configuredGatewayPorts(excludeManagedAccountId = null) {
+  const ports = new Map();
+  for (const name of discoverClients()) {
+    const port = Number(getClientConfig(name)?.gateway?.port || 0);
+    if (port) ports.set(port, `client:${name}`);
+  }
+
+  const managedRoot = '/root/.openclaw/managed-accounts';
+  if (fs.existsSync(managedRoot)) {
+    for (const entry of fs.readdirSync(managedRoot)) {
+      const id = Number(entry);
+      if (!Number.isInteger(id) || id === excludeManagedAccountId) continue;
+      const config = readJsonFile(path.join(managedRoot, entry, 'openclaw.json'), {});
+      const port = Number(config.gateway?.port || 0);
+      if (port) ports.set(port, `managed:${id}`);
+    }
+  }
+  return ports;
+}
+
+function resolveManagedGatewayPort(accountId, requestedPort, existingPort) {
+  const used = configuredGatewayPorts(accountId);
+  const persisted = Number(requestedPort || existingPort || 0);
+  if (persisted) {
+    const owner = used.get(persisted);
+    if (owner) throw new Error(`Gateway port ${persisted} already used by ${owner}`);
+    return persisted;
+  }
+
+  let candidate = 21000 + accountId * 20;
+  while (used.has(candidate) && candidate <= 65515) candidate += 20;
+  if (candidate > 65535) throw new Error('No managed gateway port available');
+  return candidate;
 }
 
 function runAsync(cmd, res, options = {}) {
@@ -210,6 +433,9 @@ function extractClient(config, name) {
 
 function buildConfigFromDashboard(name, payload, existing = {}) {
   const paths = clientPaths(name);
+  const waMode = payload.wa_mode || existing.meta?.waMode || 'client_number_bot';
+  const existingConfig = { ...existing };
+  delete existingConfig.meta;
   const trigger = payload.trigger || existing.agents?.list?.[0]?.groupChat?.mentionPatterns?.[0] || 'Hey';
   const port = Number(payload.server_port || existing.gateway?.port || 0) || undefined;
   const allowFrom = Array.isArray(payload.allowFrom) ? payload.allowFrom : (existing.channels?.whatsapp?.allowFrom || []);
@@ -228,20 +454,8 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
   const model = payload.primary_model || existing.agents?.defaults?.model?.primary || 'openai/gpt-5.5';
   const fallbacks = Array.isArray(payload.fallback_models) ? payload.fallback_models : [];
 
-  return {
-    ...existing,
-    meta: {
-      ...(existing.meta || {}),
-      name,
-      assistantType: payload.assistant_type || existing.meta?.assistantType || 'custom',
-      dashboardManaged: true,
-      assistants: payload.assistants || [],
-      integrations: payload.integrations || [],
-      linuxUser: payload.linux_user || paths.linuxUser,
-      stateDir: payload.state_dir || paths.stateDir,
-      workspaceDir: payload.workspace_dir || paths.workspaceDir,
-      codexHome: payload.codex_home || paths.codexHome,
-    },
+  const next = {
+    ...existingConfig,
     agents: {
       ...(existing.agents || {}),
       defaults: {
@@ -273,7 +487,9 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
         dmPolicy: payload.dm_policy || existing.channels?.whatsapp?.dmPolicy || 'allowlist',
         allowFrom,
         groupPolicy: payload.group_policy || existing.channels?.whatsapp?.groupPolicy || 'allowlist',
-        groupAllowFrom: inferGlobalGroupAllowFrom(payload.groups || [], allowFrom, existing.channels?.whatsapp?.groupAllowFrom || []),
+        groupAllowFrom: Array.isArray(payload.group_allow_from)
+          ? payload.group_allow_from
+          : inferGlobalGroupAllowFrom(payload.groups || [], allowFrom, existing.channels?.whatsapp?.groupAllowFrom || []),
         groups,
         debounceMs: payload.debounce_ms ?? existing.channels?.whatsapp?.debounceMs ?? 3000,
         sendReadReceipts: Boolean(payload.send_read_receipts),
@@ -289,12 +505,24 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
     session: existing.session || { dmScope: 'per-channel-peer' },
     tools: existing.tools || { profile: 'coding' },
     plugins: {
+      ...(existing.plugins || {}),
+      allow: [...new Set([...(existing.plugins?.allow || []), 'openai', 'whatsapp'])],
+      bundledDiscovery: 'compat',
       entries: {
+        ...(existing.plugins?.entries || {}),
         openai: { enabled: true },
         whatsapp: { enabled: true },
       },
     },
   };
+
+  if (waMode === 'managed_group_employee') {
+    delete next.channels.whatsapp;
+    delete next.plugins.entries.whatsapp;
+    next.plugins.allow = next.plugins.allow.filter((id) => id !== 'whatsapp');
+  }
+
+  return next;
 }
 
 function inferGlobalGroupAllowFrom(groups, allowFrom, existing) {
@@ -344,6 +572,58 @@ app.get('/clients', (_req, res) => {
   res.json(clients);
 });
 
+app.post('/clients/validate-provision', (req, res) => {
+  const { name, phone, wa_mode = 'client_number_bot', assistants = [], files = {}, config = {}, crons = [] } = req.body || {};
+  const errors = [];
+
+  if (!validName(name)) errors.push('Invalid client name');
+  if (!/^\+62[0-9]{9,13}$/.test(String(phone || ''))) errors.push('Invalid Indonesian E.164 phone');
+  if (!['client_number_bot', 'managed_group_employee'].includes(wa_mode)) errors.push('Invalid wa_mode');
+  if (!Array.isArray(assistants) || assistants.length === 0) errors.push('At least one assistant is required');
+  for (const assistant of assistants || []) {
+    if (!VALID_ASSISTANT_TYPES.includes(assistant.type)) errors.push(`Invalid assistant type: ${assistant.type || ''}`);
+  }
+  if (!files || typeof files !== 'object' || Array.isArray(files)) errors.push('files must be an object');
+  for (const file of Object.keys(files || {})) {
+    if (!isAllowedWorkspaceFile(file)) errors.push(`Unsupported workspace file: ${file}`);
+  }
+  if (!config || typeof config !== 'object' || Array.isArray(config)) errors.push('config must be an object');
+  if (wa_mode === 'client_number_bot' && config && typeof config === 'object') {
+    const plan = config.plan;
+    const expectedDm = plan === 'pro' ? 'allowlist' : 'disabled';
+    const expectedGroupAllow = plan === 'personal' ? [phone] : ['*'];
+    if (!['personal', 'plus', 'pro'].includes(plan)) errors.push('Invalid or missing config.plan');
+    if (config.dm_policy !== expectedDm) errors.push(`Invalid dm_policy for ${plan || 'unknown'} plan`);
+    if (config.group_policy !== 'allowlist') errors.push('group_policy must be allowlist');
+    if (JSON.stringify(config.group_allow_from || []) !== JSON.stringify(expectedGroupAllow)) {
+      errors.push(`Invalid group_allow_from for ${plan || 'unknown'} plan`);
+    }
+    const expectedDmAllow = plan === 'pro' ? [phone] : [];
+    if (JSON.stringify(config.allowFrom || []) !== JSON.stringify(expectedDmAllow)) {
+      errors.push(`Invalid allowFrom for ${plan || 'unknown'} plan`);
+    }
+  }
+  if (!Array.isArray(crons)) errors.push('crons must be an array');
+  for (const cron of crons || []) {
+    if (!/^[a-z][a-z0-9_-]*$/.test(String(cron.slug || ''))) errors.push(`Invalid cron slug: ${cron.slug || ''}`);
+    if (!/^\S+(\s+\S+){4}$/.test(String(cron.schedule || ''))) errors.push(`Invalid cron schedule: ${cron.slug || ''}`);
+    if (!cron.message || typeof cron.message !== 'string') errors.push(`Missing cron message: ${cron.slug || ''}`);
+    if (cron.enabled !== false) errors.push(`Cron must start disabled: ${cron.slug || ''}`);
+  }
+
+  res.status(errors.length ? 422 : 200).json({
+    ok: errors.length === 0,
+    dry_run: true,
+    errors,
+    summary: {
+      assistants: Array.isArray(assistants) ? assistants.length : 0,
+      workspace_files: files && typeof files === 'object' && !Array.isArray(files) ? Object.keys(files).length : 0,
+      config_keys: config && typeof config === 'object' && !Array.isArray(config) ? Object.keys(config) : [],
+      crons: Array.isArray(crons) ? crons.length : 0,
+    },
+  });
+});
+
 app.get('/clients/:name', (req, res) => {
   const { name } = req.params;
   if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
@@ -374,7 +654,7 @@ app.post('/clients', (req, res) => {
   if (!validName(name)) return res.status(400).json({ ok: false, error: 'name must be lowercase alphanumeric/dash/underscore' });
   if (!/^\+62[0-9]{9,13}$/.test(phone)) return res.status(400).json({ ok: false, error: 'phone must be E.164 format starting with +62' });
   if (!['personal', 'team'].includes(scope_package)) return res.status(400).json({ ok: false, error: 'scope_package must be personal or team' });
-  if (!['creator', 'finance', 'jobseeker', 'custom'].includes(assistant_type)) return res.status(400).json({ ok: false, error: 'assistant_type must be creator|finance|jobseeker|custom' });
+  if (!VALID_ASSISTANT_TYPES.includes(assistant_type)) return res.status(400).json({ ok: false, error: `assistant_type must be one of: ${VALID_ASSISTANT_TYPES.join('|')}` });
 
   const cmd = `bash ${quote(path.join(SCRIPTS_DIR, 'create-client.sh'))} ${quote(name)} ${quote(trigger)} ${quote(phone)} ${quote(scope_package)} ${quote(assistant_type)} 2>&1`;
 
@@ -456,7 +736,7 @@ app.delete('/clients/:name', (req, res) => {
   if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
   if (!getClientConfig(name)) return res.status(404).json({ ok: false, error: 'Client not found' });
 
-  const cmd = `echo ${quote(name)} | bash ${quote(path.join(SCRIPTS_DIR, 'delete-client.sh'))} ${quote(name)} 2>&1`;
+  const cmd = `echo ${quote(name)} | bash ${quote(path.join(__dirname, 'delete-client.sh'))} ${quote(name)} 2>&1`;
   runAsync(cmd, res);
 });
 
@@ -519,6 +799,194 @@ app.post('/clients/:name/workspace', (req, res) => {
 
   chownTreeIfHome(paths, paths.workspaceDir);
   res.json({ ok: true, success: true, written, workspace_dir: paths.workspaceDir });
+});
+
+app.put('/clients/:name/crons', (req, res) => {
+  const { name } = req.params;
+  if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
+  const config = getClientConfig(name);
+  if (!config) return res.status(404).json({ ok: false, error: 'Client not found' });
+
+  const jobs = req.body?.jobs;
+  if (!Array.isArray(jobs)) return res.status(400).json({ ok: false, error: 'jobs array is required' });
+
+  const errors = [];
+  for (const job of jobs) {
+    if (!/^[a-z][a-z0-9_-]*$/.test(String(job.slug || ''))) errors.push(`Invalid cron slug: ${job.slug || ''}`);
+    if (!/^\S+(\s+\S+){4}$/.test(String(job.schedule || ''))) errors.push(`Invalid cron schedule: ${job.slug || ''}`);
+    if (!job.message || typeof job.message !== 'string') errors.push(`Missing cron message: ${job.slug || ''}`);
+    if (job.enabled !== false) errors.push(`Provisioned cron must start disabled: ${job.slug || ''}`);
+  }
+  if (errors.length) return res.status(422).json({ ok: false, errors });
+
+  const port = config.gateway?.port;
+  const token = config.gateway?.auth?.token;
+  if (!port || !token) return res.status(422).json({ ok: false, error: 'Gateway port/token missing' });
+  const connection = ['--url', `ws://127.0.0.1:${port}`, '--token', token];
+
+  try {
+    const raw = execOpenClawAfterGatewayReady(['cron', 'list', '--json', ...connection], {
+      encoding: 'utf8', timeout: 30000,
+    });
+    const parsed = JSON.parse(raw || '{}');
+    const existingJobs = Array.isArray(parsed) ? parsed : (parsed.jobs || []);
+    const existingByName = new Map(existingJobs.map((job) => [job.name, job]));
+    const created = [];
+    const existing = [];
+
+    for (const job of jobs) {
+      if (existingByName.has(job.slug)) {
+        const current = existingByName.get(job.slug);
+        if (!current.id) throw new Error(`Existing cron has no id: ${job.slug}`);
+        execFileSync(NODE_BIN, [
+          OPENCLAW_BIN, 'cron', 'edit', current.id,
+          '--cron', job.schedule, '--tz', job.timezone || 'Asia/Jakarta',
+          '--agent', job.agent || 'main', '--session', job.session || 'isolated',
+          '--message', job.message, '--disable', '--no-deliver', ...connection,
+        ], { encoding: 'utf8', timeout: 30000 });
+        existing.push(job.slug);
+        continue;
+      }
+      execFileSync(NODE_BIN, [
+        OPENCLAW_BIN, 'cron', 'add', '--json', '--name', job.slug,
+        '--cron', job.schedule, '--tz', job.timezone || 'Asia/Jakarta',
+        '--agent', job.agent || 'main', '--session', job.session || 'isolated',
+        '--message', job.message, '--disabled', '--no-deliver', ...connection,
+      ], { encoding: 'utf8', timeout: 30000 });
+      created.push(job.slug);
+    }
+
+    res.json({ ok: true, success: true, created, existing, enabled: 0 });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: 'Cron sync failed', detail: String(error.stderr || error.message || '').trim() });
+  }
+});
+
+app.post('/clients/:name/workspace/adapt', (req, res) => {
+  const { name } = req.params;
+  if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
+  const paths = clientPaths(name);
+  if (!getClientConfig(name)) return res.status(404).json({ ok: false, error: 'Client not found' });
+
+  const manifest = req.body?.manifest;
+  const allowedPaths = manifest?.output_contract?.allowed_paths;
+  if (manifest?.schema_version !== 1 || !Array.isArray(allowedPaths)) {
+    return res.status(422).json({ ok: false, error: 'Invalid onboarding adapter manifest' });
+  }
+  if (allowedPaths.some((file) => !isAllowedWorkspaceFile(file))) {
+    return res.status(422).json({ ok: false, error: 'Manifest contains unsupported workspace paths' });
+  }
+  if (!fs.existsSync(CLAUDE_BIN)) return res.status(503).json({ ok: false, error: 'Claude adapter is unavailable' });
+
+  const schema = JSON.stringify({
+    type: 'object', additionalProperties: false, required: ['files'],
+    properties: {
+      files: {
+        type: 'object',
+        propertyNames: { enum: allowedPaths },
+        additionalProperties: { type: 'string', maxLength: 100000 },
+      },
+    },
+  });
+  const prompt = [
+    'Adapt onboarding data into client-specific workspace content.',
+    'Return JSON only according to the supplied schema.',
+    'Do not return or alter config, credentials, integrations, cron, router, or infrastructure.',
+    'Only include a file when onboarding data materially improves it; preserve the base template structure, preserve facts, and never invent personal data.',
+    'Current allowed base files:',
+    JSON.stringify(Object.fromEntries(allowedPaths.map((file) => {
+      const target = path.resolve(paths.workspaceDir, file);
+      return [file, fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : ''];
+    }))),
+    JSON.stringify(manifest),
+  ].join('\n\n');
+
+  try {
+    const raw = execFileSync(CLAUDE_BIN, [
+      '--print', '--model', 'sonnet', '--output-format', 'json', '--json-schema', schema,
+      '--tools', '', '--permission-mode', 'dontAsk', prompt,
+    ], { encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024, cwd: paths.workspaceDir });
+    const envelope = JSON.parse(raw);
+    const output = envelope.structured_output || envelope.result || envelope;
+    const files = output.files || {};
+    const written = [];
+    for (const [file, content] of Object.entries(files)) {
+      if (!allowedPaths.includes(file) || !isAllowedWorkspaceFile(file) || typeof content !== 'string') {
+        throw new Error(`Adapter returned forbidden file: ${file}`);
+      }
+      const target = path.resolve(paths.workspaceDir, file);
+      if (!target.startsWith(path.resolve(paths.workspaceDir) + path.sep)) throw new Error('Adapter path traversal');
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, content);
+      chownIfHome(paths, target);
+      written.push(file);
+    }
+    res.json({ ok: true, adapted: true, written });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: 'Structured workspace adaptation failed', detail: String(error.stderr || error.message || '').slice(0, 1000) });
+  }
+});
+
+app.post('/clients/:name/verify-prerequisites', (req, res) => {
+  const { name } = req.params;
+  if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
+  const paths = clientPaths(name);
+  const config = getClientConfig(name);
+  if (!config) return res.status(404).json({ ok: false, error: 'Client not found' });
+  const env = openClawEnv(paths);
+  let modelAuth = false;
+  let modelDetail = '';
+  try {
+    modelDetail = execFileSync(NODE_BIN, [OPENCLAW_BIN, 'models', 'status', '--check', '--json'], {
+      encoding: 'utf8', timeout: 60000, env,
+    });
+    modelAuth = true;
+  } catch (error) {
+    modelDetail = String(error.stderr || error.stdout || error.message || '').slice(0, 1000);
+  }
+
+  // Dashboard metadata is intentionally not stored in openclaw.json because
+  // `meta` is not part of the OpenClaw schema. A managed client has no local
+  // WhatsApp channel; delivery is owned by its managed-account gateway.
+  const waMode = config.channels?.whatsapp ? 'client_number_bot' : 'managed_group_employee';
+  const waCredentials = path.join(paths.stateDir, 'credentials', 'whatsapp', 'default', 'creds.json');
+  const whatsapp = waMode === 'managed_group_employee' ? true : fs.existsSync(waCredentials);
+  const result = {
+    ok: modelAuth && whatsapp,
+    model_auth_ok: modelAuth,
+    whatsapp_connected: whatsapp,
+    wa_mode: waMode,
+    model_detail: modelDetail,
+  };
+  res.status(result.ok ? 200 : 422).json(result);
+});
+
+app.post('/clients/:name/crons/activate', (req, res) => {
+  const { name } = req.params;
+  if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
+  const config = getClientConfig(name);
+  if (!config) return res.status(404).json({ ok: false, error: 'Client not found' });
+  const jobs = req.body?.jobs;
+  const target = String(req.body?.target || '');
+  if (!Array.isArray(jobs) || !target) return res.status(422).json({ ok: false, error: 'jobs and delivery target are required' });
+  if (!/^120[0-9]+@g\.us$/.test(target) && !/^\+[1-9][0-9]{6,14}$/.test(target)) {
+    return res.status(422).json({ ok: false, error: 'Invalid WhatsApp delivery target' });
+  }
+  const connection = ['--url', `ws://127.0.0.1:${config.gateway?.port}`, '--token', config.gateway?.auth?.token];
+  try {
+    const raw = execOpenClawAfterGatewayReady(['cron', 'list', '--json', ...connection], { encoding: 'utf8', timeout: 30000 });
+    const existing = Array.isArray(JSON.parse(raw)) ? JSON.parse(raw) : (JSON.parse(raw).jobs || []);
+    const requested = new Set(jobs.map((job) => job.slug));
+    const enabled = [];
+    for (const job of existing) {
+      if (!requested.has(job.name) || !job.id) continue;
+      execFileSync(NODE_BIN, [OPENCLAW_BIN, 'cron', 'edit', job.id, '--enable', '--announce', '--channel', 'whatsapp', '--to', target, ...connection], { encoding: 'utf8', timeout: 30000 });
+      enabled.push(job.name);
+    }
+    res.json({ ok: true, enabled, channel: 'whatsapp', target });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: 'Cron activation failed', detail: String(error.stderr || error.message || '').slice(0, 1000) });
+  }
 });
 
 app.post('/clients/:name/groups', (req, res) => {
@@ -609,7 +1077,762 @@ app.delete('/clients/:name/groups/:groupId', (req, res) => {
   res.status(404).json({ ok: false, error: 'Group not found' });
 });
 
+// ── Telegram Notification ────────────────────────────────────────────────────
+
+app.post('/notify', (req, res) => {
+  const { text, order } = req.body;
+
+  let message = text;
+
+  if (!message && order) {
+    const a = order;
+    const rawSlots = a.assistant_slots || [];
+    const slots = Array.isArray(rawSlots)
+      ? rawSlots.map(s => s.type || s).join(', ') || '-'
+      : String(rawSlots) || '-';
+    const contactWa = a.contact_wa || a.contact_whatsapp || '-';
+    message = [
+      '🔔 <b>Order Baru Masuk!</b>',
+      '',
+      `👤 <b>Nama:</b> ${a.full_name || '-'}`,
+      `📱 <b>WA:</b> ${contactWa}`,
+      a.email ? `📧 <b>Email:</b> ${a.email}` : null,
+      `🤖 <b>Asisten:</b> ${slots}`,
+      `📦 <b>Paket:</b> ${a.plan || '-'}`,
+      `🔧 <b>Mode:</b> ${a.wa_mode || '-'}`,
+      a.preferred_assistant_name ? `💬 <b>Nama Asisten:</b> ${a.preferred_assistant_name}` : null,
+      a.preferred_trigger_word   ? `⚡ <b>Trigger:</b> ${a.preferred_trigger_word}` : null,
+      a.notes || a.onboarding_notes ? `📝 <b>Catatan:</b> ${a.notes || a.onboarding_notes}` : null,
+      '',
+      `🔗 <a href="https://samsulhadissbackend.samsulhadiss.com/samsulhadiss/openclaw/orders">Buka Dashboard</a>`,
+    ].filter(l => l !== null).join('\n');
+  }
+
+  if (!message) return res.status(400).json({ ok: false, error: 'text or order required' });
+
+  sendTelegram(message);
+  res.json({ ok: true, message: 'Notification sent' });
+});
+
+// ── Auto Create WhatsApp Group ───────────────────────────────────────────────
+
+app.post('/clients/:name/groups/create', (req, res) => {
+  const { name } = req.params;
+  if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
+
+  const config = getClientConfig(name);
+  if (!config) return res.status(404).json({ ok: false, error: 'Client not found' });
+
+  const user_phone = req.body.user_phone || req.body.member_phone;
+  const group_name = req.body.group_name;
+  const idempotencyKey = req.body.idempotency_key;
+  const description = String(req.body.description || '').trim().slice(0, 500);
+  if (!user_phone) return res.status(400).json({ ok: false, error: 'user_phone (or member_phone) is required' });
+  if (!group_name) return res.status(400).json({ ok: false, error: 'group_name is required' });
+  if (!/^\+?[0-9]{8,15}$/.test(user_phone.replace(/\s/g, ''))) {
+    return res.status(400).json({ ok: false, error: 'user_phone must be a valid phone number' });
+  }
+
+  const paths = clientPaths(name);
+  const credsDir = path.join(paths.stateDir, 'credentials', 'whatsapp', 'default');
+  const groupRegistryFile = path.join(paths.stateDir, 'provisioned-groups.json');
+  const groupRegistry = readJsonFile(groupRegistryFile, {});
+  if (idempotencyKey && groupRegistry[idempotencyKey]) {
+    return res.json({ ok: true, success: true, ...groupRegistry[idempotencyKey], reused: true, group_registered: true });
+  }
+
+  if (!fs.existsSync(path.join(credsDir, 'creds.json'))) {
+    return res.status(400).json({
+      ok: false,
+      error: 'WhatsApp session not found. Run: openclaw --profile ' + name + ' channels login --channel whatsapp',
+    });
+  }
+
+  const scriptPath = path.join(__dirname, 'wa-create-group.js');
+  const nodebin = process.execPath;
+
+  // Stop gateway → create group → restart gateway
+  try {
+    const svc = paths.serviceName;
+    const scope = paths.serviceScope === 'system' ? '' : '--user ';
+    try { run(`systemctl ${scope}stop ${quote(svc)}`); } catch {}
+
+    const cmd = `${quote(nodebin)} ${quote(scriptPath)} ${quote(credsDir)} ${quote(group_name)} ${quote(user_phone)}`;
+
+    exec(cmd, {
+      encoding: 'utf8', timeout: 60000,
+      env: { ...process.env, WA_GROUP_DESCRIPTION: description },
+    }, (error, stdout) => {
+      // Always restart gateway regardless of outcome
+      try { run(`systemctl ${scope}start ${quote(paths.serviceName)}`); } catch {}
+
+      let result;
+      try { result = JSON.parse(stdout.trim()); } catch {
+        return res.status(500).json({ ok: false, error: 'Failed to parse group creation output', raw: stdout.slice(0, 200) });
+      }
+
+      if (!result.ok) {
+        return res.status(500).json(result);
+      }
+
+      if (idempotencyKey) {
+        groupRegistry[idempotencyKey] = {
+          group_id: result.group_id,
+          invite_link: result.invite_link || null,
+          group_name,
+          partial_success: Boolean(result.partial_success),
+          participant_added: result.participant_added !== false,
+          missing_participants: result.missing_participants || [],
+          warning: result.warning || null,
+        };
+        fs.writeFileSync(groupRegistryFile, JSON.stringify(groupRegistry, null, 2) + '\n');
+      }
+
+      // Auto-register the new group into the client config
+      const updatedConfig = getClientConfig(name);
+      if (updatedConfig) {
+        updatedConfig.channels = updatedConfig.channels || {};
+        updatedConfig.channels.whatsapp = updatedConfig.channels.whatsapp || {};
+        updatedConfig.channels.whatsapp.groups = updatedConfig.channels.whatsapp.groups || {};
+        updatedConfig.channels.whatsapp.groups[result.group_id] = {
+          name: group_name,
+          requireMention: true,
+          assistantSlot: 1,
+        };
+        writeClientConfig(name, updatedConfig);
+      }
+
+      sendTelegram(
+        `✅ <b>Group WA berhasil dibuat!</b>\n\n` +
+        `👤 Client: <code>${name}</code>\n` +
+        `👥 Group: <b>${group_name}</b>\n` +
+        `🆔 ID: <code>${result.group_id}</code>` +
+        (result.invite_link ? `\n🔗 <a href="${result.invite_link}">Link Undangan</a>` : '')
+      );
+
+      res.json({ ok: true, success: true, ...result, group_registered: true });
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── Managed Router ───────────────────────────────────────────────────────────
+// Convention:
+//   Creds dir : /root/.openclaw/managed-accounts/{id}/credentials/whatsapp/default/
+//   Routes    : /root/.openclaw/managed-accounts/{id}/routes.json
+//   Service   : openclaw-managed-{id}-gateway.service
+
+function managedAccountPaths(accountId) {
+  const base = `/root/.openclaw/managed-accounts/${accountId}`;
+  return {
+    base,
+    credsDir:  `${base}/credentials/whatsapp/default`,
+    routesFile: `${base}/routes.json`,
+    configPath: `${base}/openclaw.json`,
+    workspaceDir: `${base}/workspace`,
+    serviceName: `openclaw-managed-${accountId}-gateway.service`,
+    serviceFile: `/etc/systemd/system/openclaw-managed-${accountId}-gateway.service`,
+  };
+}
+
+function readManagedRoutes(accountId) {
+  const { routesFile } = managedAccountPaths(accountId);
+  if (!fs.existsSync(routesFile)) return [];
+  try { return JSON.parse(fs.readFileSync(routesFile, 'utf8')); } catch { return []; }
+}
+
+function writeManagedRoutes(accountId, routes) {
+  const { base, routesFile } = managedAccountPaths(accountId);
+  fs.mkdirSync(base, { recursive: true });
+  fs.writeFileSync(routesFile, JSON.stringify(routes, null, 2) + '\n');
+}
+
+function buildManagedNativeConfig(accountId, routes, account = {}) {
+  const paths = managedAccountPaths(accountId);
+  const existing = readJsonFile(paths.configPath, {});
+  // `meta` is not part of the OpenClaw config schema. Older dashboard builds
+  // wrote provisioning metadata there, causing `channels login` and gateway
+  // startup to fail validation. Keep dashboard metadata in routes/account data
+  // instead and explicitly strip a legacy top-level `meta` on every rebuild.
+  const existingConfig = { ...existing };
+  delete existingConfig.meta;
+  const clients = new Map();
+  for (const route of routes) {
+    if (!route.client_name || !route.agent_workspace || !route.agent_dir) continue;
+    if (!clients.has(route.client_name)) clients.set(route.client_name, route);
+  }
+  const dmClients = Array.isArray(account.dm_clients) ? account.dm_clients : [];
+  for (const client of dmClients) {
+    if (!client.client_name || !client.agent_workspace || !client.agent_dir) continue;
+    if (!clients.has(client.client_name)) clients.set(client.client_name, client);
+  }
+
+  const agents = [...clients.values()].map((route, index) => ({
+    id: route.client_name,
+    default: index === 0,
+    name: route.client_name,
+    workspace: route.agent_workspace,
+    agentDir: route.agent_dir,
+    model: route.primary_model || 'openai/gpt-5.5',
+    groupChat: {
+      mentionPatterns: [route.trigger || 'Hey', `@${route.trigger || 'Hey'}`],
+    },
+  }));
+  if (agents.length === 0) {
+    agents.push({
+      id: 'bootstrap',
+      default: true,
+      name: 'Managed WhatsApp Bootstrap',
+      workspace: paths.workspaceDir,
+      agentDir: path.join(paths.base, 'agents', 'bootstrap', 'agent'),
+    });
+  }
+
+  const groupBindings = routes.map((route) => ({
+    agentId: route.client_name,
+    comment: `Managed WA account ${accountId}, assistant slot ${route.assistant_slot || 1}`,
+    match: {
+      channel: 'whatsapp',
+      peer: { kind: 'group', id: route.group_jid },
+    },
+  }));
+  const dmBindings = dmClients
+    .filter(client => client.client_name && client.owner_phone)
+    .map(client => ({
+      agentId: client.client_name,
+      comment: `Managed WA account ${accountId}, owner-only personal DM`,
+      match: {
+        channel: 'whatsapp',
+        peer: { kind: 'direct', id: client.owner_phone },
+      },
+    }));
+  const bindings = [...groupBindings, ...dmBindings];
+
+  const groups = {};
+  for (const route of routes) {
+    groups[route.group_jid] = {
+      requireMention: route.require_mention !== false,
+      systemPrompt: route.system_prompt || undefined,
+    };
+  }
+
+  const ownerPhones = [...new Set([
+    ...routes.map(route => route.owner_phone),
+    ...dmClients.map(client => client.owner_phone),
+  ].filter(Boolean))];
+  const allowEveryone = routes.some((route) => route.group_scope === 'everyone');
+  const port = resolveManagedGatewayPort(accountId, account.gateway_port, existing.gateway?.port);
+  const token = existing.gateway?.auth?.token || crypto.randomBytes(24).toString('hex');
+
+  return {
+    ...existingConfig,
+    agents: {
+      defaults: {
+        ...(existing.agents?.defaults || {}),
+        model: existing.agents?.defaults?.model || {
+          primary: 'openai/gpt-5.5',
+          fallbacks: [],
+        },
+      },
+      list: agents,
+    },
+    bindings,
+    channels: {
+      whatsapp: {
+        enabled: true,
+        dmPolicy: ownerPhones.length > 0 ? 'allowlist' : 'disabled',
+        allowFrom: ownerPhones,
+        groupPolicy: 'allowlist',
+        groupAllowFrom: allowEveryone ? ['*'] : ownerPhones,
+        groups,
+        debounceMs: 3000,
+        sendReadReceipts: false,
+      },
+    },
+    gateway: {
+      mode: 'local',
+      port,
+      bind: 'loopback',
+      auth: { mode: 'token', token },
+    },
+    session: { dmScope: 'per-channel-peer' },
+    tools: existing.tools || { profile: 'coding' },
+    plugins: {
+      allow: ['openai', 'whatsapp'],
+      bundledDiscovery: 'compat',
+      entries: {
+        openai: { enabled: true },
+        whatsapp: { enabled: true },
+      },
+    },
+  };
+}
+
+function installManagedNativeService(accountId, config) {
+  const paths = managedAccountPaths(accountId);
+  fs.mkdirSync(paths.base, { recursive: true });
+  fs.mkdirSync(paths.credsDir, { recursive: true });
+  fs.mkdirSync(paths.workspaceDir, { recursive: true });
+  fs.writeFileSync(paths.configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+
+  // Install through the official npm source so OpenClaw grants trusted plugin
+  // capabilities (required by WhatsApp's keyed credential store). A plain
+  // directory copy loads but remains untrusted and crashes the channel.
+  const trustedPluginPackage = path.join(
+    paths.base,
+    'npm/projects/openclaw-whatsapp-290d7f7427/node_modules/@openclaw/whatsapp/package.json',
+  );
+  if (!fs.existsSync(trustedPluginPackage)) {
+    execFileSync(NODE_BIN, [OPENCLAW_BIN, 'plugins', 'install', WHATSAPP_PLUGIN_SPEC], {
+      encoding: 'utf8',
+      timeout: 120000,
+      env: {
+        ...process.env,
+        HOME: '/root',
+        OPENCLAW_STATE_DIR: paths.base,
+        OPENCLAW_CONFIG_PATH: paths.configPath,
+        CODEX_HOME: '/root/.codex',
+      },
+    });
+  }
+
+  const unit = `[Unit]\nDescription=OpenClaw Managed WhatsApp Gateway #${accountId}\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=root\nWorkingDirectory=${paths.base}\nEnvironment=HOME=/root\nEnvironment=OPENCLAW_STATE_DIR=${paths.base}\nEnvironment=OPENCLAW_CONFIG_PATH=${paths.configPath}\nEnvironment=CODEX_HOME=/root/.codex\nExecStart=${NODE_BIN} ${OPENCLAW_BIN} gateway --port ${config.gateway.port}\nRestart=always\nRestartSec=5\nRestartPreventExitStatus=78\n\n[Install]\nWantedBy=multi-user.target\n`;
+  fs.writeFileSync(paths.serviceFile, unit);
+  run('systemctl daemon-reload');
+}
+
+app.get('/managed-router/:accountId/status', async (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+  const { credsDir, serviceName, routesFile, configPath } = managedAccountPaths(accountId);
+  const identity = whatsappSessionIdentity(credsDir);
+  const expectedPhone = normalizePhone(req.query.expected_phone);
+  const actualPhone = normalizePhone(identity.session_phone);
+  const phoneMatches = !expectedPhone || (Boolean(actualPhone) && actualPhone === expectedPhone);
+  let serviceStatus = 'unknown';
+  try { serviceStatus = run(`systemctl is-active ${quote(serviceName)} 2>/dev/null; true`); } catch { serviceStatus = 'inactive'; }
+  const routes = readManagedRoutes(accountId);
+  const model = getManagedModelRuntime(serviceName);
+  const channel = serviceStatus === 'active'
+    ? await getManagedChannelRuntime(accountId)
+    : { checked: false, connected: false, running: false, linked: identity.credentials_exist, health_state: 'service-inactive', error_category: 'gateway_inactive', last_error: null };
+  const connected = identity.credentials_exist && serviceStatus === 'active' && phoneMatches && channel.connected;
+  res.json({
+    ok: true,
+    account_id: accountId,
+    wa_connected: connected,
+    credentials_exist: identity.credentials_exist,
+    config_exists: fs.existsSync(configPath),
+    session_phone: identity.session_phone,
+    session_name: identity.session_name,
+    expected_phone: expectedPhone ? `+${expectedPhone}` : null,
+    phone_matches: phoneMatches,
+    service_status: serviceStatus,
+    route_count: routes.length,
+    channel,
+    model,
+  });
+});
+
+app.put('/managed-router/:accountId/routes', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+  const routes = req.body?.routes;
+  const account = req.body?.account || {};
+  if (!Array.isArray(routes)) {
+    return res.status(400).json({ ok: false, error: 'routes array is required' });
+  }
+  writeManagedRoutes(accountId, routes);
+  try {
+    const config = buildManagedNativeConfig(accountId, routes, account);
+    installManagedNativeService(accountId, config);
+    const { serviceName } = managedAccountPaths(accountId);
+    let restarted = false;
+    try {
+      if (run(`systemctl is-active ${quote(serviceName)} 2>/dev/null; true`) === 'active') {
+        run(`systemctl restart ${quote(serviceName)}`);
+        restarted = true;
+      }
+    } catch {}
+    res.json({ ok: true, success: true, route_count: routes.length, routing_mode: 'native-bindings', gateway_port: config.gateway.port, restarted });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: 'Failed to compile native managed gateway', detail: error.message });
+  }
+});
+
+app.post('/managed-router/:accountId/routes', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+  const route = req.body;
+  if (!route?.group_jid) {
+    return res.status(400).json({ ok: false, error: 'group_jid is required' });
+  }
+  const routes = readManagedRoutes(accountId);
+  const idx = routes.findIndex(r => r.group_jid === route.group_jid);
+  if (idx >= 0) routes[idx] = route; else routes.push(route);
+  writeManagedRoutes(accountId, routes);
+  res.json({ ok: true, success: true, upserted: route.group_jid });
+});
+
+app.delete('/managed-router/:accountId/routes/:groupJid', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+  const groupJid = decodeURIComponent(req.params.groupJid);
+  const routes = readManagedRoutes(accountId);
+  const next = routes.filter(r => r.group_jid !== groupJid);
+  writeManagedRoutes(accountId, next);
+  res.json({ ok: true, success: true, removed: routes.length - next.length });
+});
+
+app.post('/managed-router/:accountId/reload', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+  const { serviceName } = managedAccountPaths(accountId);
+  try {
+    const active = run(`systemctl is-active ${quote(serviceName)} 2>/dev/null; true`) === 'active';
+    if (active) run(`systemctl restart ${quote(serviceName)}`);
+    res.json({ ok: true, success: true, active, message: active ? 'Native gateway restarted' : 'Config ready; QR login is still required' });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/managed-router/:accountId/activate', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const { credsDir, serviceName } = managedAccountPaths(accountId);
+  if (!fs.existsSync(path.join(credsDir, 'creds.json'))) {
+    return res.status(422).json({ ok: false, error: 'WhatsApp belum login. Jalankan login QR terlebih dahulu.' });
+  }
+  try {
+    run(`systemctl enable ${quote(serviceName)}`);
+    run(`systemctl restart ${quote(serviceName)}`);
+    res.json({ ok: true, success: true, service_status: 'active' });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/managed-router/:accountId/login/start', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const current = managedLoginSessions.get(accountId);
+  if (current?.status === 'running') return res.json({ ok: true, status: 'running' });
+  const paths = managedAccountPaths(accountId);
+  if (!fs.existsSync(paths.configPath)) return res.status(422).json({ ok: false, error: 'Push managed routes terlebih dahulu.' });
+  const identity = whatsappSessionIdentity(paths.credsDir);
+  if (identity.credentials_exist) {
+    return res.status(409).json({
+      ok: false,
+      error: 'Session WhatsApp sudah ada. Reset session terlebih dahulu jika ingin pair ulang.',
+      session_phone: identity.session_phone,
+    });
+  }
+
+  const command = `${NODE_BIN} ${OPENCLAW_BIN} channels login --channel whatsapp`;
+  const child = spawn('/usr/bin/script', ['-qefc', command, '/dev/null'], {
+    env: { ...process.env, HOME: '/root', OPENCLAW_STATE_DIR: paths.base, OPENCLAW_CONFIG_PATH: paths.configPath, CODEX_HOME: '/root/.codex', TERM: 'xterm-256color' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const session = { status: 'running', output: '', started_at: new Date().toISOString(), exit_code: null, child };
+  managedLoginSessions.set(accountId, session);
+  // A WhatsApp QR rendered with ANSI background cells can exceed 30 KB.
+  // Keep enough terminal output for at least one complete OpenClaw QR; cutting
+  // through the matrix produces a wide, incomplete image that cannot be scanned.
+  const append = (chunk) => { session.output = (session.output + chunk.toString()).slice(-250000); };
+  child.stdout.on('data', append);
+  child.stderr.on('data', append);
+  child.on('error', (error) => { session.status = 'failed'; session.output += `\n${error.message}`; });
+  child.on('exit', (code) => {
+    session.exit_code = code;
+    session.status = fs.existsSync(path.join(paths.credsDir, 'creds.json')) ? 'connected' : (code === 0 ? 'finished' : 'failed');
+  });
+  setTimeout(() => {
+    if (session.status === 'running') { child.kill('SIGTERM'); session.status = 'timeout'; }
+  }, 180000);
+  res.json({ ok: true, status: 'running' });
+});
+
+app.post('/managed-router/:accountId/session/reset', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+
+  const paths = managedAccountPaths(accountId);
+  const session = managedLoginSessions.get(accountId);
+  if (session?.status === 'running' && session.child) {
+    session.child.kill('SIGTERM');
+    session.status = 'cancelled';
+  }
+
+  try { run(`systemctl stop ${quote(paths.serviceName)} 2>/dev/null || true`); } catch {}
+
+  const credsRoot = path.dirname(paths.credsDir);
+  let backup_path = null;
+  if (fs.existsSync(credsRoot)) {
+    backup_path = `${credsRoot}.backup-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    fs.renameSync(credsRoot, backup_path);
+  }
+  fs.mkdirSync(paths.credsDir, { recursive: true, mode: 0o700 });
+  managedLoginSessions.delete(accountId);
+
+  res.json({ ok: true, reset: true, backup_path, service_status: 'stopped' });
+});
+
+app.get('/managed-router/:accountId/login/status', async (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  const paths = managedAccountPaths(accountId);
+  const session = managedLoginSessions.get(accountId);
+  const credentialsExist = fs.existsSync(path.join(paths.credsDir, 'creds.json'));
+  const runtime = credentialsExist ? await getManagedChannelRuntime(accountId) : null;
+  const connected = runtime?.connected === true;
+  const renderTerminalOutput = (value) => String(value || '')
+    // OpenClaw renders QR modules as two spaces with ANSI background colors.
+    // Convert them before removing ANSI so browsers receive a scannable,
+    // monochrome QR instead of blank lines.
+    .replace(/\x1B\[40m {2}\x1B\[0m/g, '██')
+    .replace(/\x1B\[47m {2}\x1B\[0m/g, '  ')
+    // OSC sequences (terminal title, hyperlinks, and similar payloads).
+    .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, '')
+    // CSI sequences (colors, cursor movement, erase-line, etc.).
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+    // Remaining two-byte escape sequences.
+    .replace(/\x1B[@-_]/g, '')
+    .replace(/\r/g, '');
+  res.json({
+    ok: true,
+    status: connected ? 'connected' : (credentialsExist ? 'linked_not_connected' : (session?.status || 'idle')),
+    connected,
+    credentials_exist: credentialsExist,
+    runtime,
+    output: renderTerminalOutput(session?.output || ''),
+    started_at: session?.started_at || null,
+    exit_code: session?.exit_code ?? null,
+  });
+});
+
+app.post('/managed-router/:accountId/create-group', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+
+  const { group_name, participant_phone, idempotency_key } = req.body;
+  const description = String(req.body.description || '').trim().slice(0, 500);
+  if (!group_name) return res.status(400).json({ ok: false, error: 'group_name is required' });
+  if (!participant_phone) return res.status(400).json({ ok: false, error: 'participant_phone is required' });
+  if (!/^\+?[0-9]{8,15}$/.test(participant_phone.replace(/\s/g, ''))) {
+    return res.status(400).json({ ok: false, error: 'participant_phone must be a valid phone number' });
+  }
+
+  const { base, credsDir, serviceName } = managedAccountPaths(accountId);
+  const groupRegistryFile = path.join(base, 'provisioned-groups.json');
+  const groupRegistry = readJsonFile(groupRegistryFile, {});
+  if (idempotency_key && groupRegistry[idempotency_key]) {
+    return res.json({ ok: true, success: true, ...groupRegistry[idempotency_key], reused: true });
+  }
+  if (!fs.existsSync(path.join(credsDir, 'creds.json'))) {
+    return res.status(400).json({
+      ok: false,
+      error: `Managed WA account ${accountId} has no active session. Scan QR first and store creds at: ${credsDir}`,
+    });
+  }
+
+  const scriptPath = path.join(__dirname, 'wa-create-group.js');
+  const nodebin = process.execPath;
+
+  try {
+    try { run(`systemctl stop ${quote(serviceName)} 2>/dev/null || true`); } catch {}
+
+    const cmd = `${quote(nodebin)} ${quote(scriptPath)} ${quote(credsDir)} ${quote(group_name)} ${quote(participant_phone)}`;
+
+    exec(cmd, {
+      encoding: 'utf8', timeout: 60000,
+      env: { ...process.env, WA_GROUP_DESCRIPTION: description },
+    }, (error, stdout) => {
+      try { run(`systemctl start ${quote(serviceName)} 2>/dev/null || true`); } catch {}
+
+      let result;
+      try { result = JSON.parse(stdout.trim()); } catch {
+        return res.status(500).json({ ok: false, error: 'Failed to parse group creation output', raw: stdout.slice(0, 200) });
+      }
+
+      if (!result.ok) return res.status(500).json(result);
+
+      if (idempotency_key) {
+        fs.mkdirSync(base, { recursive: true });
+        groupRegistry[idempotency_key] = {
+          group_id: result.group_id,
+          invite_link: result.invite_link || null,
+          group_name,
+          partial_success: Boolean(result.partial_success),
+          participant_added: result.participant_added !== false,
+          missing_participants: result.missing_participants || [],
+          warning: result.warning || null,
+        };
+        fs.writeFileSync(groupRegistryFile, JSON.stringify(groupRegistry, null, 2) + '\n');
+      }
+
+      sendTelegram(
+        `✅ <b>Group WA Managed berhasil dibuat!</b>\n\n` +
+        `🏦 Account: <code>#${accountId}</code>\n` +
+        `👥 Group: <b>${group_name}</b>\n` +
+        `🆔 JID: <code>${result.group_id}</code>` +
+        (result.invite_link ? `\n🔗 <a href="${result.invite_link}">Link Undangan</a>` : '')
+      );
+
+      res.json({ ok: true, success: true, ...result });
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/managed-router/:accountId/group-invites', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+
+  const registry = readJsonFile(path.join(managedAccountPaths(accountId).base, 'provisioned-groups.json'), {});
+  const groups = Object.entries(registry).map(([idempotencyKey, entry]) => ({
+    idempotency_key: idempotencyKey,
+    group_id: entry.group_id || null,
+    group_name: entry.group_name || null,
+    invite_link: entry.invite_link || null,
+    participant_added: entry.participant_added !== false,
+    partial_success: Boolean(entry.partial_success),
+    warning: entry.warning || null,
+  }));
+
+  res.json({ ok: true, groups });
+});
+
+app.delete('/managed-router/:accountId/clients/:clientId/registry', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  const clientId = parseInt(req.params.clientId);
+  if (!Number.isInteger(accountId) || accountId < 1 || !Number.isInteger(clientId) || clientId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId or clientId' });
+  }
+
+  const registryFile = path.join(managedAccountPaths(accountId).base, 'provisioned-groups.json');
+  const registry = readJsonFile(registryFile, {});
+  const prefix = `client:${clientId}:`;
+  let removed = 0;
+  for (const key of Object.keys(registry)) {
+    if (!key.startsWith(prefix)) continue;
+    delete registry[key];
+    removed += 1;
+  }
+  fs.writeFileSync(registryFile, JSON.stringify(registry, null, 2) + '\n');
+  res.json({ ok: true, removed });
+});
+
+app.post('/managed-router/:accountId/create-groups', (req, res) => {
+  const accountId = parseInt(req.params.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    return res.status(400).json({ ok: false, error: 'Invalid accountId' });
+  }
+
+  const requested = req.body?.groups;
+  if (!Array.isArray(requested) || requested.length < 1 || requested.length > 8) {
+    return res.status(400).json({ ok: false, error: 'groups must contain 1-8 entries' });
+  }
+  for (const group of requested) {
+    if (!group?.group_name || !group?.participant_phone || !group?.idempotency_key) {
+      return res.status(400).json({ ok: false, error: 'Each group requires group_name, participant_phone, and idempotency_key' });
+    }
+    if (!/^\+?[0-9]{8,15}$/.test(String(group.participant_phone).replace(/\s/g, ''))) {
+      return res.status(400).json({ ok: false, error: 'participant_phone must be a valid phone number' });
+    }
+    if (group.description !== undefined && typeof group.description !== 'string') {
+      return res.status(400).json({ ok: false, error: 'description must be a string' });
+    }
+    group.description = String(group.description || '').trim().slice(0, 500);
+  }
+
+  const { base, credsDir, serviceName } = managedAccountPaths(accountId);
+  if (!fs.existsSync(path.join(credsDir, 'creds.json'))) {
+    return res.status(400).json({ ok: false, error: 'Managed WhatsApp session is not paired' });
+  }
+
+  const registryFile = path.join(base, 'provisioned-groups.json');
+  const registry = readJsonFile(registryFile, {});
+  const reused = [];
+  const pending = [];
+  for (const group of requested) {
+    const existing = registry[group.idempotency_key];
+    if (existing) reused.push({ ...existing, idempotency_key: group.idempotency_key, reused: true });
+    else pending.push(group);
+  }
+  if (pending.length === 0) {
+    return res.json({ ok: true, success: true, groups: reused, reused_count: reused.length, created_count: 0 });
+  }
+
+  try { run(`systemctl stop ${quote(serviceName)} 2>/dev/null || true`); } catch {}
+  const scriptPath = path.join(__dirname, 'wa-create-groups.js');
+  execFile(process.execPath, [scriptPath, credsDir, JSON.stringify(pending)], {
+    encoding: 'utf8',
+    timeout: 180000,
+    maxBuffer: 1024 * 1024,
+  }, (error, stdout) => {
+    try { run(`systemctl start ${quote(serviceName)} 2>/dev/null || true`); } catch {}
+
+    let result;
+    try { result = JSON.parse(stdout.trim()); } catch {
+      return res.status(500).json({ ok: false, error: 'Failed to parse batch group output', raw: stdout.slice(0, 300) });
+    }
+    if (error || !result.ok) {
+      return res.status(500).json({ ok: false, error: result?.error || error?.message || 'Batch group creation failed', groups: result?.groups || [] });
+    }
+
+    for (const group of result.groups) {
+      const source = pending.find(item => item.idempotency_key === group.idempotency_key);
+      registry[group.idempotency_key] = {
+        group_id: group.group_id,
+        invite_link: group.invite_link || null,
+        group_name: source?.group_name || group.group_name,
+        partial_success: Boolean(group.partial_success),
+        participant_added: group.participant_added !== false,
+        missing_participants: group.missing_participants || [],
+        warning: group.warning || null,
+      };
+    }
+    fs.mkdirSync(base, { recursive: true });
+    fs.writeFileSync(registryFile, JSON.stringify(registry, null, 2) + '\n');
+
+    sendTelegram(
+      `✅ <b>${result.groups.length} Group WA Managed dibuat</b>\n\n` +
+      result.groups.map(group => {
+        const saved = registry[group.idempotency_key];
+        return `👥 <b>${saved.group_name}</b>\n🆔 <code>${saved.group_id}</code>` +
+          (saved.invite_link ? `\n🔗 <a href="${saved.invite_link}">Link Undangan</a>` : '');
+      }).join('\n\n')
+    );
+
+    res.json({
+      ok: true,
+      success: true,
+      groups: [...reused, ...result.groups],
+      reused_count: reused.length,
+      created_count: result.groups.length,
+    });
+  });
+});
+
 app.listen(PORT, HOST, () => {
   console.log(`OpenClaw API Server running on ${HOST}:${PORT}`);
-  console.log(`Token: ${API_TOKEN.slice(0, 8)}...`);
+  setTimeout(() => monitorManagedWhatsApp().catch(() => {}), 5000);
+  setInterval(() => monitorManagedWhatsApp().catch(() => {}), 60000);
 });
