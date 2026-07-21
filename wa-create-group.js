@@ -62,6 +62,13 @@ async function main() {
         try {
           const result = await sock.groupCreate(groupName, participantJIDs);
           const groupId = result.id;
+          let descriptionSet = false;
+          if (process.env.WA_GROUP_DESCRIPTION) {
+            try {
+              await sock.groupUpdateDescription(groupId, process.env.WA_GROUP_DESCRIPTION.slice(0, 500));
+              descriptionSet = true;
+            } catch {}
+          }
 
           let metadata = result;
           try {
@@ -97,6 +104,7 @@ async function main() {
             missing_participants: missingPhones,
             participant_count: participantIds.length,
             group_id: groupId,
+            description_set: descriptionSet,
             invite_link: inviteLink,
             warning: missingPhones.length > 0
               ? 'Group dibuat, tetapi member belum terverifikasi masuk. Gunakan link undangan.'

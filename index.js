@@ -17,6 +17,10 @@ const OPENCLAW_BIN = '/root/.nvm/versions/node/v22.22.0/lib/node_modules/opencla
 const CLAUDE_BIN = '/root/.nvm/versions/node/v22.22.0/bin/claude';
 const WHATSAPP_PLUGIN_SPEC = '@openclaw/whatsapp@2026.5.27';
 const managedLoginSessions = new Map();
+const MANAGED_RUNTIME_STATE_FILE = '/root/.openclaw/managed-runtime-health.json';
+const managedRuntimeChecks = new Map(
+  Object.entries(readJsonFile(MANAGED_RUNTIME_STATE_FILE, {})).map(([id, state]) => [Number(id), state]),
+);
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8731741557:AAFjdZjoXrcCdZPTHiJFjCjuo2ZRtOYP8YE';
 const TELEGRAM_CHAT  = process.env.TELEGRAM_CHAT_ID  || '652689793';
@@ -118,6 +122,108 @@ function whatsappSessionIdentity(credsDir) {
     session_phone: phone ? `+${phone}` : null,
     session_name: creds?.me?.name || null,
   };
+}
+
+function classifyWhatsAppError(value) {
+  const error = String(value || '');
+  if (/401|unauthorized|logged out/i.test(error)) return 'auth_logged_out';
+  if (/timed?out|ETIMEDOUT/i.test(error)) return 'network_timeout';
+  if (/ECONN|ENOTFOUND|network/i.test(error)) return 'network_error';
+  return error ? 'channel_error' : null;
+}
+
+function persistManagedRuntimeChecks() {
+  fs.mkdirSync(path.dirname(MANAGED_RUNTIME_STATE_FILE), { recursive: true });
+  fs.writeFileSync(MANAGED_RUNTIME_STATE_FILE, JSON.stringify(Object.fromEntries(managedRuntimeChecks), null, 2) + '\n');
+}
+
+function getManagedChannelRuntime(accountId) {
+  const paths = managedAccountPaths(accountId);
+  const config = readJsonFile(paths.configPath, {});
+  const port = Number(config.gateway?.port || 0);
+  const token = config.gateway?.auth?.token;
+  if (!port || !token) {
+    return Promise.resolve({ checked: false, connected: false, running: false, health_state: 'not-configured', error_category: 'gateway_not_configured' });
+  }
+
+  return new Promise(resolve => {
+    execFile(NODE_BIN, [OPENCLAW_BIN, 'channels', 'status', '--json', '--url', `ws://127.0.0.1:${port}`, '--token', token], {
+      encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, HOME: '/root', OPENCLAW_STATE_DIR: paths.base, OPENCLAW_CONFIG_PATH: paths.configPath, CODEX_HOME: '/root/.codex' },
+    }, (error, stdout) => {
+      let parsed = {};
+      try { parsed = JSON.parse(String(stdout || '').trim()); } catch {}
+      const channel = parsed.channels?.whatsapp || parsed.channelAccounts?.whatsapp?.[0] || {};
+      let lastError = channel.lastError || parsed.error || error?.message || null;
+      if (channel.connected !== true && !lastError) {
+        try {
+          const logs = run(`journalctl -u ${quote(paths.serviceName)} --since '-15 minutes' --no-pager -n 120 2>/dev/null; true`, { timeout: 10000 });
+          lastError = logs.split('\n').filter(line => /401|unauthorized|logged out|connection failure|ETIMEDOUT|ECONN/i.test(line)).at(-1) || null;
+        } catch {}
+      }
+      resolve({
+        checked: true,
+        connected: channel.connected === true,
+        running: channel.running === true,
+        linked: channel.linked === true || channel.statusState === 'linked',
+        health_state: channel.healthState || (channel.connected ? 'healthy' : 'disconnected'),
+        last_connected_at: channel.lastConnectedAt || null,
+        last_inbound_at: channel.lastInboundAt || null,
+        last_message_at: channel.lastMessageAt || null,
+        error_category: classifyWhatsAppError(lastError),
+        last_error: lastError ? String(lastError).slice(0, 500) : null,
+      });
+    });
+  });
+}
+
+function getManagedModelRuntime(serviceName) {
+  let logs = '';
+  try {
+    logs = run(`journalctl -u ${quote(serviceName)} --since '-15 minutes' --no-pager -n 160 2>/dev/null; true`, { timeout: 10000 });
+  } catch {}
+  const lines = logs.split('\n').filter(line => /invalid_refresh|authentication_error|all models failed|provider auth|rate.?limit|model.*error/i.test(line));
+  const lastError = lines.at(-1) || null;
+  let errorCategory = null;
+  if (/invalid_refresh|authentication_error|provider auth/i.test(lastError || '')) errorCategory = 'model_auth_error';
+  else if (/rate.?limit/i.test(lastError || '')) errorCategory = 'model_rate_limit';
+  else if (/all models failed|model.*error/i.test(lastError || '')) errorCategory = 'model_runtime_error';
+  return {
+    checked: true,
+    status: errorCategory ? 'error' : 'no_recent_error',
+    error_category: errorCategory,
+    last_error: lastError ? lastError.slice(0, 500) : null,
+    window_minutes: 15,
+  };
+}
+
+async function monitorManagedWhatsApp() {
+  const managedRoot = '/root/.openclaw/managed-accounts';
+  if (!fs.existsSync(managedRoot)) return;
+  for (const entry of fs.readdirSync(managedRoot)) {
+    const accountId = Number(entry);
+    if (!Number.isInteger(accountId)) continue;
+    const paths = managedAccountPaths(accountId);
+    const identity = whatsappSessionIdentity(paths.credsDir);
+    if (!identity.credentials_exist) continue;
+    const runtime = await getManagedChannelRuntime(accountId);
+    const model = getManagedModelRuntime(paths.serviceName);
+    const previous = managedRuntimeChecks.get(accountId);
+    managedRuntimeChecks.set(accountId, { connected: runtime.connected, model_error: model.error_category });
+    persistManagedRuntimeChecks();
+    if (previous === undefined && !runtime.connected) {
+      sendTelegram(`🚨 <b>Managed WhatsApp #${accountId} terputus</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nStatus: <code>${runtime.health_state}</code>\nPenyebab: <code>${runtime.error_category || 'unknown'}</code>\nBuka Managed WA Account, lepas session, lalu pair ulang bila status menunjukkan auth_logged_out.`);
+    } else if (previous?.connected === true && !runtime.connected) {
+      sendTelegram(`🚨 <b>Managed WhatsApp #${accountId} baru saja terputus</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nPenyebab: <code>${runtime.error_category || 'unknown'}</code>`);
+    } else if (previous?.connected === false && runtime.connected) {
+      sendTelegram(`✅ <b>Managed WhatsApp #${accountId} pulih</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nChannel kembali connected.`);
+    }
+    if (model.error_category && previous?.model_error !== model.error_category) {
+      sendTelegram(`⚠️ <b>Model/provider error pada managed bot #${accountId}</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nPenyebab: <code>${model.error_category}</code>\nWhatsApp: <code>${runtime.connected ? 'connected' : 'disconnected'}</code>`);
+    } else if (!model.error_category && previous?.model_error) {
+      sendTelegram(`✅ <b>Model/provider managed bot #${accountId} pulih</b>\nTidak ada error baru dalam 15 menit terakhir.`);
+    }
+  }
 }
 
 function configuredGatewayPorts(excludeManagedAccountId = null) {
@@ -1020,6 +1126,7 @@ app.post('/clients/:name/groups/create', (req, res) => {
   const user_phone = req.body.user_phone || req.body.member_phone;
   const group_name = req.body.group_name;
   const idempotencyKey = req.body.idempotency_key;
+  const description = String(req.body.description || '').trim().slice(0, 500);
   if (!user_phone) return res.status(400).json({ ok: false, error: 'user_phone (or member_phone) is required' });
   if (!group_name) return res.status(400).json({ ok: false, error: 'group_name is required' });
   if (!/^\+?[0-9]{8,15}$/.test(user_phone.replace(/\s/g, ''))) {
@@ -1052,7 +1159,10 @@ app.post('/clients/:name/groups/create', (req, res) => {
 
     const cmd = `${quote(nodebin)} ${quote(scriptPath)} ${quote(credsDir)} ${quote(group_name)} ${quote(user_phone)}`;
 
-    exec(cmd, { encoding: 'utf8', timeout: 60000 }, (error, stdout) => {
+    exec(cmd, {
+      encoding: 'utf8', timeout: 60000,
+      env: { ...process.env, WA_GROUP_DESCRIPTION: description },
+    }, (error, stdout) => {
       // Always restart gateway regardless of outcome
       try { run(`systemctl ${scope}start ${quote(paths.serviceName)}`); } catch {}
 
@@ -1292,12 +1402,12 @@ function installManagedNativeService(accountId, config) {
   run('systemctl daemon-reload');
 }
 
-app.get('/managed-router/:accountId/status', (req, res) => {
+app.get('/managed-router/:accountId/status', async (req, res) => {
   const accountId = parseInt(req.params.accountId);
   if (!Number.isInteger(accountId) || accountId < 1) {
     return res.status(400).json({ ok: false, error: 'Invalid accountId' });
   }
-  const { credsDir, serviceName, routesFile } = managedAccountPaths(accountId);
+  const { credsDir, serviceName, routesFile, configPath } = managedAccountPaths(accountId);
   const identity = whatsappSessionIdentity(credsDir);
   const expectedPhone = normalizePhone(req.query.expected_phone);
   const actualPhone = normalizePhone(identity.session_phone);
@@ -1305,18 +1415,25 @@ app.get('/managed-router/:accountId/status', (req, res) => {
   let serviceStatus = 'unknown';
   try { serviceStatus = run(`systemctl is-active ${quote(serviceName)} 2>/dev/null; true`); } catch { serviceStatus = 'inactive'; }
   const routes = readManagedRoutes(accountId);
-  const connected = identity.credentials_exist && serviceStatus === 'active' && phoneMatches;
+  const model = getManagedModelRuntime(serviceName);
+  const channel = serviceStatus === 'active'
+    ? await getManagedChannelRuntime(accountId)
+    : { checked: false, connected: false, running: false, linked: identity.credentials_exist, health_state: 'service-inactive', error_category: 'gateway_inactive', last_error: null };
+  const connected = identity.credentials_exist && serviceStatus === 'active' && phoneMatches && channel.connected;
   res.json({
     ok: true,
     account_id: accountId,
     wa_connected: connected,
     credentials_exist: identity.credentials_exist,
+    config_exists: fs.existsSync(configPath),
     session_phone: identity.session_phone,
     session_name: identity.session_name,
     expected_phone: expectedPhone ? `+${expectedPhone}` : null,
     phone_matches: phoneMatches,
     service_status: serviceStatus,
     route_count: routes.length,
+    channel,
+    model,
   });
 });
 
@@ -1472,12 +1589,14 @@ app.post('/managed-router/:accountId/session/reset', (req, res) => {
   res.json({ ok: true, reset: true, backup_path, service_status: 'stopped' });
 });
 
-app.get('/managed-router/:accountId/login/status', (req, res) => {
+app.get('/managed-router/:accountId/login/status', async (req, res) => {
   const accountId = parseInt(req.params.accountId);
   if (!Number.isInteger(accountId) || accountId < 1) return res.status(400).json({ ok: false, error: 'Invalid accountId' });
   const paths = managedAccountPaths(accountId);
   const session = managedLoginSessions.get(accountId);
-  const connected = fs.existsSync(path.join(paths.credsDir, 'creds.json'));
+  const credentialsExist = fs.existsSync(path.join(paths.credsDir, 'creds.json'));
+  const runtime = credentialsExist ? await getManagedChannelRuntime(accountId) : null;
+  const connected = runtime?.connected === true;
   const renderTerminalOutput = (value) => String(value || '')
     // OpenClaw renders QR modules as two spaces with ANSI background colors.
     // Convert them before removing ANSI so browsers receive a scannable,
@@ -1491,7 +1610,16 @@ app.get('/managed-router/:accountId/login/status', (req, res) => {
     // Remaining two-byte escape sequences.
     .replace(/\x1B[@-_]/g, '')
     .replace(/\r/g, '');
-  res.json({ ok: true, status: connected ? 'connected' : (session?.status || 'idle'), connected, output: renderTerminalOutput(session?.output || ''), started_at: session?.started_at || null, exit_code: session?.exit_code ?? null });
+  res.json({
+    ok: true,
+    status: connected ? 'connected' : (credentialsExist ? 'linked_not_connected' : (session?.status || 'idle')),
+    connected,
+    credentials_exist: credentialsExist,
+    runtime,
+    output: renderTerminalOutput(session?.output || ''),
+    started_at: session?.started_at || null,
+    exit_code: session?.exit_code ?? null,
+  });
 });
 
 app.post('/managed-router/:accountId/create-group', (req, res) => {
@@ -1501,6 +1629,7 @@ app.post('/managed-router/:accountId/create-group', (req, res) => {
   }
 
   const { group_name, participant_phone, idempotency_key } = req.body;
+  const description = String(req.body.description || '').trim().slice(0, 500);
   if (!group_name) return res.status(400).json({ ok: false, error: 'group_name is required' });
   if (!participant_phone) return res.status(400).json({ ok: false, error: 'participant_phone is required' });
   if (!/^\+?[0-9]{8,15}$/.test(participant_phone.replace(/\s/g, ''))) {
@@ -1528,7 +1657,10 @@ app.post('/managed-router/:accountId/create-group', (req, res) => {
 
     const cmd = `${quote(nodebin)} ${quote(scriptPath)} ${quote(credsDir)} ${quote(group_name)} ${quote(participant_phone)}`;
 
-    exec(cmd, { encoding: 'utf8', timeout: 60000 }, (error, stdout) => {
+    exec(cmd, {
+      encoding: 'utf8', timeout: 60000,
+      env: { ...process.env, WA_GROUP_DESCRIPTION: description },
+    }, (error, stdout) => {
       try { run(`systemctl start ${quote(serviceName)} 2>/dev/null || true`); } catch {}
 
       let result;
@@ -1624,6 +1756,10 @@ app.post('/managed-router/:accountId/create-groups', (req, res) => {
     if (!/^\+?[0-9]{8,15}$/.test(String(group.participant_phone).replace(/\s/g, ''))) {
       return res.status(400).json({ ok: false, error: 'participant_phone must be a valid phone number' });
     }
+    if (group.description !== undefined && typeof group.description !== 'string') {
+      return res.status(400).json({ ok: false, error: 'description must be a string' });
+    }
+    group.description = String(group.description || '').trim().slice(0, 500);
   }
 
   const { base, credsDir, serviceName } = managedAccountPaths(accountId);
@@ -1697,4 +1833,6 @@ app.post('/managed-router/:accountId/create-groups', (req, res) => {
 
 app.listen(PORT, HOST, () => {
   console.log(`OpenClaw API Server running on ${HOST}:${PORT}`);
+  setTimeout(() => monitorManagedWhatsApp().catch(() => {}), 5000);
+  setInterval(() => monitorManagedWhatsApp().catch(() => {}), 60000);
 });

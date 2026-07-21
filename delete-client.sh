@@ -37,6 +37,22 @@ rm -f -- "${SERVICE_FILE}"
 systemctl daemon-reload
 
 if id "${LINUX_USER}" >/dev/null 2>&1; then
+  # A per-user systemd manager can survive after the gateway stops and makes
+  # userdel fail after it has already removed the home directory. Terminate
+  # that session first so deletion remains atomic from the caller's view.
+  loginctl disable-linger "${LINUX_USER}" 2>/dev/null || true
+  loginctl terminate-user "${LINUX_USER}" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    pgrep -u "${LINUX_USER}" >/dev/null 2>&1 || break
+    sleep 1
+  done
+  if pgrep -u "${LINUX_USER}" >/dev/null 2>&1; then
+    pkill -TERM -u "${LINUX_USER}" 2>/dev/null || true
+    sleep 1
+  fi
+  if pgrep -u "${LINUX_USER}" >/dev/null 2>&1; then
+    pkill -KILL -u "${LINUX_USER}" 2>/dev/null || true
+  fi
   userdel -r "${LINUX_USER}"
 elif [[ -d "${HOME_DIR}" ]]; then
   rm -rf -- "${HOME_DIR}"

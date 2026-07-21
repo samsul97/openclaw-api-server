@@ -49,6 +49,13 @@ async function main() {
             const spec = groups[index];
             const participantJid = `${String(spec.participant_phone).replace(/[^0-9]/g, '')}@s.whatsapp.net`;
             const created = await sock.groupCreate(spec.group_name, [participantJid]);
+            let descriptionSet = false;
+            if (spec.description) {
+              try {
+                await sock.groupUpdateDescription(created.id, String(spec.description).slice(0, 500));
+                descriptionSet = true;
+              } catch {}
+            }
             let metadata = created;
             try { metadata = await sock.groupMetadata(created.id); } catch {}
             const participantIds = (metadata?.participants || created?.participants || [])
@@ -64,6 +71,7 @@ async function main() {
               idempotency_key: spec.idempotency_key,
               group_id: created.id,
               group_name: spec.group_name,
+              description_set: descriptionSet,
               partial_success: !participantAdded,
               participant_added: participantAdded,
               missing_participants: participantAdded ? [] : [participantJid],
