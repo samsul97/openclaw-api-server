@@ -15,6 +15,10 @@ LINUX_USER="openclaw-${NAME}"
 HOME_DIR="/home/${LINUX_USER}"
 STATE_DIR="${HOME_DIR}/.openclaw"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+LEGACY_STATE_DIR="/root/.openclaw-${NAME}"
+LEGACY_WORKSPACE_DIR="/root/.openclaw/workspace-${NAME}"
+LEGACY_CODEX_HOME="/root/.codex-${NAME}"
+LEGACY_MEMORY_DB="/root/.openclaw/memory/${NAME}.sqlite"
 
 if [[ "$LINUX_USER" == "root" || "$HOME_DIR" == "/root" || "$HOME_DIR" == "/home" ]]; then
   echo "Forbidden target"
@@ -56,6 +60,21 @@ if id "${LINUX_USER}" >/dev/null 2>&1; then
   userdel -r "${LINUX_USER}"
 elif [[ -d "${HOME_DIR}" ]]; then
   rm -rf -- "${HOME_DIR}"
+fi
+
+# Older dashboard/model-sync versions could leave client-specific state under
+# /root even after the runtime moved to the isolated /home layout. These paths
+# are exact slug-derived targets and are removed only after the validated home
+# client and typed confirmation above have both succeeded.
+for LEGACY_PATH in "${LEGACY_STATE_DIR}" "${LEGACY_WORKSPACE_DIR}" "${LEGACY_CODEX_HOME}"; do
+  if [[ -L "${LEGACY_PATH}" ]]; then
+    rm -f -- "${LEGACY_PATH}"
+  elif [[ -e "${LEGACY_PATH}" ]]; then
+    rm -rf -- "${LEGACY_PATH}"
+  fi
+done
+if [[ -f "${LEGACY_MEMORY_DB}" || -L "${LEGACY_MEMORY_DB}" ]]; then
+  rm -f -- "${LEGACY_MEMORY_DB}"
 fi
 
 echo "Client '${NAME}' deleted"

@@ -586,7 +586,9 @@ function extractClient(config, name) {
   return {
     name,
     trigger: firstAgent.groupChat?.mentionPatterns?.[0] || '',
-    phone: wa.allowFrom?.[0] || '',
+    phone: wa.allowFrom?.[0] === '*'
+      ? (whatsappSessionIdentity(path.join(paths.stateDir, 'credentials/whatsapp/default')).session_phone || '')
+      : (wa.allowFrom?.[0] || ''),
     port: config.gateway?.port,
     scope_package: groupAllowFrom.includes('*') ? 'team' : 'personal',
     assistant_type: config.meta?.assistantType || config.meta?.assistant_type || 'custom',

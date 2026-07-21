@@ -57,8 +57,6 @@ def sync_profile(args):
     if not profile or not args.profile_id.startswith("openai:"):
         raise RuntimeError("Selected OpenAI profile was not found in pool")
 
-    if not os.path.isfile(args.target):
-        raise RuntimeError("Client auth SQLite does not exist; finish client provisioning first")
     backup = None
     if os.path.isfile(args.target):
         backup_dir = os.path.join(os.path.dirname(args.target), "auth-backups")
@@ -71,6 +69,21 @@ def sync_profile(args):
         finally:
             backup_conn.close()
             source_conn.close()
+
+    os.makedirs(os.path.dirname(args.target), exist_ok=True)
+    if not os.path.isfile(args.target):
+        conn = sqlite3.connect(args.target)
+        try:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS auth_profile_store (
+                    store_key TEXT NOT NULL PRIMARY KEY,
+                    store_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )"""
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     target, row_exists = load_store(args.target)
     profiles = target.setdefault("profiles", {})
