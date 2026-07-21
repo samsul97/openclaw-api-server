@@ -2063,7 +2063,10 @@ app.post('/model-pool/:accountId/login/input', (req, res) => {
   if (!session?.child || session.status !== 'running') return res.status(409).json({ ok: false, error: 'No active login session' });
   const input = String(req.body?.input || '');
   if (!input || input.length > 4096) return res.status(422).json({ ok: false, error: 'Input must contain 1-4096 characters' });
-  session.child.stdin.write(`${input}\n`);
+  // Interactive prompts running inside a PTY submit on carriage return. A
+  // newline alone is rendered but does not trigger the prompt's Enter key.
+  session.child.stdin.write(input);
+  session.child.stdin.write('\r');
   res.json({ ok: true, accepted: true });
 });
 
