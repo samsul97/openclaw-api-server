@@ -91,7 +91,7 @@ export function evaluateCronCollision(
   listSchedules = activeCronSchedules,
 ) {
   const stateDir = String(config.stateDir || '');
-  const minGapMinutes = Number(config.minGapMinutes ?? 15);
+  const minGapMinutes = Number(config.minGapMinutes ?? 5);
   if (!stateDir || !Number.isInteger(minGapMinutes) || minGapMinutes < 0 || minGapMinutes > 180) {
     return {
       block: true,

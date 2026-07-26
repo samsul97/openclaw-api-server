@@ -34,7 +34,7 @@
         "type": "integer",
         "minimum": 0,
         "maximum": 180,
-        "default": 15
+        "default": 5
       }
     }
   }

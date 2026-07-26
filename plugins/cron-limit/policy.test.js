@@ -93,8 +93,8 @@ test('allows removal of ordinary user cron', () => {
 
 test('blocks a recurring cron within the configured minimum gap', () => {
   const result = evaluateCronCollision(
-    { stateDir: '/state', minGapMinutes: 15 },
-    { schedule: { kind: 'cron', expr: '35 7 * * *', tz: 'Asia/Jakarta' } },
+    { stateDir: '/state', minGapMinutes: 5 },
+    { schedule: { kind: 'cron', expr: '33 7 * * *', tz: 'Asia/Jakarta' } },
     () => [{
       id: 'existing',
       name: 'admin_daily_agenda',
@@ -104,14 +104,14 @@ test('blocks a recurring cron within the configured minimum gap', () => {
     }],
   );
   assert.equal(result.block, true);
-  assert.match(result.blockReason, /07:45/);
+  assert.match(result.blockReason, /07:35/);
   assert.match(result.blockReason, /mengonfirmasi/);
 });
 
 test('allows a recurring cron at exactly the minimum gap', () => {
   const result = evaluateCronCollision(
-    { stateDir: '/state', minGapMinutes: 15 },
-    { schedule: { kind: 'cron', expr: '45 7 * * *', tz: 'Asia/Jakarta' } },
+    { stateDir: '/state', minGapMinutes: 5 },
+    { schedule: { kind: 'cron', expr: '35 7 * * *', tz: 'Asia/Jakarta' } },
     () => [{
       id: 'existing',
       name: 'admin_daily_agenda',
@@ -125,7 +125,7 @@ test('allows a recurring cron at exactly the minimum gap', () => {
 
 test('does not collide recurring jobs with different recurrence fields', () => {
   const result = evaluateCronCollision(
-    { stateDir: '/state', minGapMinutes: 15 },
+    { stateDir: '/state', minGapMinutes: 5 },
     { schedule: { kind: 'cron', expr: '30 7 * * 2', tz: 'Asia/Jakarta' } },
     () => [{
       id: 'existing',
@@ -140,8 +140,8 @@ test('does not collide recurring jobs with different recurrence fields', () => {
 
 test('blocks one-shot reminders inside the minimum gap', () => {
   const result = evaluateCronCollision(
-    { stateDir: '/state', minGapMinutes: 15 },
-    { schedule: { kind: 'at', at: '2026-08-01T03:10:00.000Z' } },
+    { stateDir: '/state', minGapMinutes: 5 },
+    { schedule: { kind: 'at', at: '2026-08-01T03:03:00.000Z' } },
     () => [{
       id: 'existing',
       name: 'one_shot',
