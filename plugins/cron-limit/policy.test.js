@@ -168,6 +168,67 @@ test('blocks one-shot reminders inside the minimum gap', () => {
   assert.equal(result.block, true);
 });
 
+test('blocks a one-shot reminder near an existing recurring job on that date', () => {
+  const result = evaluateCronCollision(
+    { stateDir: '/state', minGapMinutes: 5 },
+    { schedule: { kind: 'at', at: '2026-08-03T00:33:00.000Z' } },
+    () => [{
+      id: 'weekly-admin',
+      name: 'admin_monday',
+      kind: 'cron',
+      expr: '30 7 * * 1',
+      tz: 'Asia/Jakarta',
+    }],
+  );
+  assert.equal(result.block, true);
+  assert.match(result.blockReason, /admin_monday/);
+});
+
+test('allows a one-shot reminder when the recurring job does not run that day', () => {
+  const result = evaluateCronCollision(
+    { stateDir: '/state', minGapMinutes: 5 },
+    { schedule: { kind: 'at', at: '2026-08-04T00:33:00.000Z' } },
+    () => [{
+      id: 'weekly-admin',
+      name: 'admin_monday',
+      kind: 'cron',
+      expr: '30 7 * * 1',
+      tz: 'Asia/Jakarta',
+    }],
+  );
+  assert.equal(result, undefined);
+});
+
+test('blocks a recurring job near an existing one-shot on its occurrence date', () => {
+  const result = evaluateCronCollision(
+    { stateDir: '/state', minGapMinutes: 5 },
+    { schedule: { kind: 'cron', expr: '30 7 * * 1', tz: 'Asia/Jakarta' } },
+    () => [{
+      id: 'meeting',
+      name: 'meeting_once',
+      kind: 'at',
+      at: '2026-08-03T00:33:00.000Z',
+    }],
+  );
+  assert.equal(result.block, true);
+  assert.match(result.blockReason, /meeting_once/);
+});
+
+test('detects cross-kind collisions around midnight', () => {
+  const result = evaluateCronCollision(
+    { stateDir: '/state', minGapMinutes: 5 },
+    { schedule: { kind: 'at', at: '2026-08-03T17:02:00.000Z' } },
+    () => [{
+      id: 'late-night',
+      name: 'daily_2359',
+      kind: 'cron',
+      expr: '59 23 * * *',
+      tz: 'Asia/Jakarta',
+    }],
+  );
+  assert.equal(result.block, true);
+});
+
 test('excludes the job itself while validating an update', () => {
   const result = evaluateCronCollision(
     { stateDir: '/state', minGapMinutes: 5 },

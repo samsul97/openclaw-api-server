@@ -86,6 +86,13 @@ function shiftCronTime(expr, minutes) {
   return `${minute} ${hour} ${parsed.recurrence}`;
 }
 
+function cronWithReferenceTime(expr, referenceExpr) {
+  const schedule = parseSimpleCron(expr);
+  const reference = parseSimpleCron(referenceExpr);
+  if (!schedule || !reference) return null;
+  return `${reference.minute} ${reference.hour} ${schedule.recurrence}`;
+}
+
 function formatCronTime(expr) {
   const parsed = parseSimpleCron(expr);
   if (!parsed) return expr;
@@ -173,6 +180,54 @@ function findRecurringConflict(expr, timezone, existing, minGapMinutes) {
   });
 }
 
+function zonedDateParts(timestamp, timezone) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date(timestamp));
+  return Object.fromEntries(parts.map((part) => [part.type, part.value]));
+}
+
+function cronMatchesInstant(expr, timezone, timestamp) {
+  const schedule = parseSimpleCron(expr);
+  if (!schedule) return false;
+  const parts = zonedDateParts(timestamp, timezone);
+  if (Number(parts.hour) !== schedule.hour || Number(parts.minute) !== schedule.minute) return false;
+  const matchesDate = cronDateMatcher(schedule);
+  if (!matchesDate) return false;
+  return matchesDate(new Date(Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+  )));
+}
+
+function recurringOccursNearInstant(expr, timezone, instant, minGapMinutes) {
+  const gapMs = minGapMinutes * 60000;
+  const firstMinute = Math.floor((instant - gapMs + 1) / 60000) * 60000;
+  const lastMinute = Math.ceil((instant + gapMs - 1) / 60000) * 60000;
+  for (let timestamp = firstMinute; timestamp <= lastMinute; timestamp += 60000) {
+    if (Math.abs(timestamp - instant) < gapMs && cronMatchesInstant(expr, timezone, timestamp)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findOneShotConflictForRecurring(expr, timezone, existing, minGapMinutes) {
+  return existing.find((job) => {
+    if (job.kind !== 'at') return false;
+    const instant = Date.parse(job.at);
+    return Number.isFinite(instant)
+      && recurringOccursNearInstant(expr, timezone, instant, minGapMinutes);
+  });
+}
+
 export function evaluateCronCollision(
   config,
   candidateJob,
@@ -197,11 +252,15 @@ export function evaluateCronCollision(
     if (schedule.kind === 'at' && schedule.at) {
       const candidateAt = Date.parse(schedule.at);
       if (!Number.isFinite(candidateAt)) return undefined;
-      const conflict = existing.find((job) =>
-        job.kind === 'at'
-        && Number.isFinite(Date.parse(job.at))
-        && Math.abs(Date.parse(job.at) - candidateAt) < minGapMinutes * 60000
-      );
+      const conflict = existing.find((job) => {
+        if (job.kind === 'at') {
+          return Number.isFinite(Date.parse(job.at))
+            && Math.abs(Date.parse(job.at) - candidateAt) < minGapMinutes * 60000;
+        }
+        if (job.kind !== 'cron' || !job.expr) return false;
+        const timezone = String(job.tz || 'Asia/Jakarta');
+        return recurringOccursNearInstant(job.expr, timezone, candidateAt, minGapMinutes);
+      });
       if (!conflict) return undefined;
       return {
         block: true,
@@ -212,13 +271,25 @@ export function evaluateCronCollision(
     if (schedule.kind !== 'cron' || !schedule.expr) return undefined;
     const candidate = parseSimpleCron(schedule.expr);
     const candidateTz = String(schedule.tz || 'Asia/Jakarta');
-    const conflict = findRecurringConflict(schedule.expr, candidateTz, existing, minGapMinutes);
+    const conflict = findRecurringConflict(schedule.expr, candidateTz, existing, minGapMinutes)
+      || findOneShotConflictForRecurring(schedule.expr, candidateTz, existing, minGapMinutes);
     if (!conflict) return undefined;
 
+    let suggestionBase = schedule.expr;
+    if (conflict.kind === 'cron' && conflict.expr) {
+      suggestionBase = cronWithReferenceTime(schedule.expr, conflict.expr) || schedule.expr;
+    } else if (conflict.kind === 'at') {
+      const instant = Date.parse(conflict.at);
+      if (Number.isFinite(instant) && candidate) {
+        const parts = zonedDateParts(instant, candidateTz);
+        suggestionBase = `${Number(parts.minute)} ${Number(parts.hour)} ${candidate.recurrence}`;
+      }
+    }
     const suggestions = Array.from({ length: 36 }, (_, index) => minGapMinutes * (index + 1))
-      .map((offset) => shiftCronTime(conflict.expr, offset))
+      .map((offset) => shiftCronTime(suggestionBase, offset))
       .filter(Boolean)
       .filter((expr) => !findRecurringConflict(expr, candidateTz, existing, minGapMinutes))
+      .filter((expr) => !findOneShotConflictForRecurring(expr, candidateTz, existing, minGapMinutes))
       .map(formatCronTime);
     const uniqueSuggestions = [...new Set(suggestions)].slice(0, 3);
     const alternatives = uniqueSuggestions.length > 0
