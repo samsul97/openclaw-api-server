@@ -24,6 +24,16 @@ export default definePluginEntry({
           if (quotaResult) return quotaResult;
           return evaluateCronCollision(config, event.params?.job);
         }
+        if (action === 'update') {
+          const patch = event.params?.patch;
+          if (!patch?.schedule) return;
+          return evaluateCronCollision(
+            config,
+            { schedule: patch.schedule },
+            undefined,
+            String(event.params?.jobId || event.params?.id || ''),
+          );
+        }
         if (action === 'remove') {
           return evaluateCronRemove(config, String(event.params?.jobId || event.params?.id || ''));
         }

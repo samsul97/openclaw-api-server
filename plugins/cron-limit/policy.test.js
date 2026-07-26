@@ -123,7 +123,23 @@ test('allows a recurring cron at exactly the minimum gap', () => {
   assert.equal(result, undefined);
 });
 
-test('does not collide recurring jobs with different recurrence fields', () => {
+test('detects overlap between a daily cron and a Monday cron', () => {
+  const result = evaluateCronCollision(
+    { stateDir: '/state', minGapMinutes: 5 },
+    { schedule: { kind: 'cron', expr: '30 7 * * *', tz: 'Asia/Jakarta' } },
+    () => [{
+      id: 'existing',
+      name: 'monday_job',
+      kind: 'cron',
+      expr: '30 7 * * 1',
+      tz: 'Asia/Jakarta',
+    }],
+  );
+  assert.equal(result.block, true);
+  assert.match(result.blockReason, /monday_job/);
+});
+
+test('allows recurring jobs on disjoint weekdays', () => {
   const result = evaluateCronCollision(
     { stateDir: '/state', minGapMinutes: 5 },
     { schedule: { kind: 'cron', expr: '30 7 * * 2', tz: 'Asia/Jakarta' } },
@@ -150,4 +166,46 @@ test('blocks one-shot reminders inside the minimum gap', () => {
     }],
   );
   assert.equal(result.block, true);
+});
+
+test('excludes the job itself while validating an update', () => {
+  const result = evaluateCronCollision(
+    { stateDir: '/state', minGapMinutes: 5 },
+    { schedule: { kind: 'cron', expr: '30 7 * * *', tz: 'Asia/Jakarta' } },
+    () => [{
+      id: 'job-being-updated',
+      name: 'admin_daily_agenda',
+      kind: 'cron',
+      expr: '30 7 * * *',
+      tz: 'Asia/Jakarta',
+    }],
+    'job-being-updated',
+  );
+  assert.equal(result, undefined);
+});
+
+test('still detects another assistant job while validating an update', () => {
+  const result = evaluateCronCollision(
+    { stateDir: '/state', minGapMinutes: 5 },
+    { schedule: { kind: 'cron', expr: '32 7 * * *', tz: 'Asia/Jakarta' } },
+    () => [
+      {
+        id: 'job-being-updated',
+        name: 'career_reminder',
+        kind: 'cron',
+        expr: '0 9 * * 1',
+        tz: 'Asia/Jakarta',
+      },
+      {
+        id: 'different-assistant',
+        name: 'admin_daily_agenda',
+        kind: 'cron',
+        expr: '30 7 * * *',
+        tz: 'Asia/Jakarta',
+      },
+    ],
+    'job-being-updated',
+  );
+  assert.equal(result.block, true);
+  assert.match(result.blockReason, /admin_daily_agenda/);
 });

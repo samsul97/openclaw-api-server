@@ -58,7 +58,14 @@ function parseSimpleCron(expr) {
       || !Number.isInteger(hour) || hour < 0 || hour > 23) {
     return null;
   }
-  return { minute, hour, recurrence: fields.slice(2).join(' ') };
+  return {
+    minute,
+    hour,
+    recurrence: fields.slice(2).join(' '),
+    dayOfMonth: fields[2],
+    month: fields[3],
+    dayOfWeek: fields[4],
+  };
 }
 
 function minuteOfDay(schedule) {
@@ -85,10 +92,79 @@ function formatCronTime(expr) {
   return `${String(parsed.hour).padStart(2, '0')}:${String(parsed.minute).padStart(2, '0')}`;
 }
 
+function expandCronField(field, min, max, normalize = (value) => value) {
+  const values = new Set();
+  const source = String(field || '').trim();
+  if (!source) return null;
+
+  for (const part of source.split(',')) {
+    const [rangePart, rawStep] = part.split('/');
+    const step = rawStep === undefined ? 1 : Number(rawStep);
+    if (!Number.isInteger(step) || step < 1) return null;
+
+    let start;
+    let end;
+    if (rangePart === '*') {
+      start = min;
+      end = max;
+    } else if (rangePart.includes('-')) {
+      const [rawStart, rawEnd] = rangePart.split('-');
+      start = Number(rawStart);
+      end = Number(rawEnd);
+    } else {
+      start = Number(rangePart);
+      end = start;
+    }
+    if (!Number.isInteger(start) || !Number.isInteger(end)
+        || start < min || end > max || start > end) {
+      return null;
+    }
+    for (let value = start; value <= end; value += step) values.add(normalize(value));
+  }
+  return values;
+}
+
+function cronDateMatcher(schedule) {
+  const months = expandCronField(schedule.month, 1, 12);
+  const monthDays = expandCronField(schedule.dayOfMonth, 1, 31);
+  const weekDays = expandCronField(schedule.dayOfWeek, 0, 7, (value) => value === 7 ? 0 : value);
+  if (!months || !monthDays || !weekDays) return null;
+  const monthDayWildcard = schedule.dayOfMonth === '*';
+  const weekDayWildcard = schedule.dayOfWeek === '*';
+
+  return (date) => {
+    if (!months.has(date.getUTCMonth() + 1)) return false;
+    const monthDayMatches = monthDays.has(date.getUTCDate());
+    const weekDayMatches = weekDays.has(date.getUTCDay());
+    if (monthDayWildcard && weekDayWildcard) return true;
+    if (monthDayWildcard) return weekDayMatches;
+    if (weekDayWildcard) return monthDayMatches;
+    // Vixie-style cron: when both fields are restricted, either may match.
+    return monthDayMatches || weekDayMatches;
+  };
+}
+
+function cronRecurrencesOverlap(left, right) {
+  const leftMatches = cronDateMatcher(left);
+  const rightMatches = cronDateMatcher(right);
+  if (!leftMatches || !rightMatches) {
+    return left.recurrence === right.recurrence;
+  }
+
+  // Four years cover every weekday/month combination and a leap day.
+  const start = Date.UTC(2024, 0, 1);
+  for (let offset = 0; offset < 1462; offset += 1) {
+    const date = new Date(start + offset * 86400000);
+    if (leftMatches(date) && rightMatches(date)) return true;
+  }
+  return false;
+}
+
 export function evaluateCronCollision(
   config,
   candidateJob,
   listSchedules = activeCronSchedules,
+  excludeJobId = '',
 ) {
   const stateDir = String(config.stateDir || '');
   const minGapMinutes = Number(config.minGapMinutes ?? 5);
@@ -103,7 +179,8 @@ export function evaluateCronCollision(
   if (!schedule || typeof schedule !== 'object') return undefined;
 
   try {
-    const existing = listSchedules(stateDir);
+    const existing = listSchedules(stateDir)
+      .filter((job) => String(job.id || '') !== String(excludeJobId || ''));
     if (schedule.kind === 'at' && schedule.at) {
       const candidateAt = Date.parse(schedule.at);
       if (!Number.isFinite(candidateAt)) return undefined;
@@ -128,7 +205,7 @@ export function evaluateCronCollision(
       if (!candidate || !current) return job.expr === schedule.expr;
       const currentTz = String(job.tz || 'Asia/Jakarta');
       return currentTz === candidateTz
-        && current.recurrence === candidate.recurrence
+        && cronRecurrencesOverlap(current, candidate)
         && circularMinuteDistance(minuteOfDay(current), minuteOfDay(candidate)) < minGapMinutes;
     });
     if (!conflict) return undefined;
