@@ -160,6 +160,19 @@ function cronRecurrencesOverlap(left, right) {
   return false;
 }
 
+function findRecurringConflict(expr, timezone, existing, minGapMinutes) {
+  const candidate = parseSimpleCron(expr);
+  return existing.find((job) => {
+    if (job.kind !== 'cron' || !job.expr) return false;
+    const current = parseSimpleCron(job.expr);
+    if (!candidate || !current) return job.expr === expr;
+    const currentTz = String(job.tz || 'Asia/Jakarta');
+    return currentTz === timezone
+      && cronRecurrencesOverlap(current, candidate)
+      && circularMinuteDistance(minuteOfDay(current), minuteOfDay(candidate)) < minGapMinutes;
+  });
+}
+
 export function evaluateCronCollision(
   config,
   candidateJob,
@@ -199,23 +212,17 @@ export function evaluateCronCollision(
     if (schedule.kind !== 'cron' || !schedule.expr) return undefined;
     const candidate = parseSimpleCron(schedule.expr);
     const candidateTz = String(schedule.tz || 'Asia/Jakarta');
-    const conflict = existing.find((job) => {
-      if (job.kind !== 'cron' || !job.expr) return false;
-      const current = parseSimpleCron(job.expr);
-      if (!candidate || !current) return job.expr === schedule.expr;
-      const currentTz = String(job.tz || 'Asia/Jakarta');
-      return currentTz === candidateTz
-        && cronRecurrencesOverlap(current, candidate)
-        && circularMinuteDistance(minuteOfDay(current), minuteOfDay(candidate)) < minGapMinutes;
-    });
+    const conflict = findRecurringConflict(schedule.expr, candidateTz, existing, minGapMinutes);
     if (!conflict) return undefined;
 
-    const suggestions = [minGapMinutes, minGapMinutes * 2, minGapMinutes * 3]
+    const suggestions = Array.from({ length: 36 }, (_, index) => minGapMinutes * (index + 1))
       .map((offset) => shiftCronTime(conflict.expr, offset))
       .filter(Boolean)
+      .filter((expr) => !findRecurringConflict(expr, candidateTz, existing, minGapMinutes))
       .map(formatCronTime);
-    const alternatives = suggestions.length > 0
-      ? ` Alternatif terdekat: ${suggestions.join(', ')} ${candidateTz}.`
+    const uniqueSuggestions = [...new Set(suggestions)].slice(0, 3);
+    const alternatives = uniqueSuggestions.length > 0
+      ? ` Alternatif terdekat: ${uniqueSuggestions.join(', ')} ${candidateTz}.`
       : '';
     return {
       block: true,

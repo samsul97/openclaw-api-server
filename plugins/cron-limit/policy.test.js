@@ -209,3 +209,29 @@ test('still detects another assistant job while validating an update', () => {
   assert.equal(result.block, true);
   assert.match(result.blockReason, /admin_daily_agenda/);
 });
+
+test('suggested alternatives exclude slots occupied by another assistant', () => {
+  const result = evaluateCronCollision(
+    { stateDir: '/state', minGapMinutes: 5 },
+    { schedule: { kind: 'cron', expr: '2 7 * * *', tz: 'Asia/Jakarta' } },
+    () => [
+      {
+        id: 'finance',
+        name: 'finance_weekly',
+        kind: 'cron',
+        expr: '0 7 * * 1',
+        tz: 'Asia/Jakarta',
+      },
+      {
+        id: 'health',
+        name: 'health_daily',
+        kind: 'cron',
+        expr: '15 7 * * *',
+        tz: 'Asia/Jakarta',
+      },
+    ],
+  );
+  assert.equal(result.block, true);
+  assert.match(result.blockReason, /07:05, 07:10, 07:20/);
+  assert.doesNotMatch(result.blockReason, /07:15/);
+});
