@@ -769,11 +769,13 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
   const maxCronTotal = Number(cronPolicy.max_total);
   const defaultCronCount = Number(cronPolicy.default_count);
   const additionalCronLimit = Number(cronPolicy.additional_limit);
+  const maxConcurrentCronRuns = Number(cronPolicy.max_concurrent_runs);
   if (!Number.isInteger(maxCronTotal) || maxCronTotal < 0 || maxCronTotal > 500
       || !Number.isInteger(defaultCronCount) || defaultCronCount < 0
       || !Number.isInteger(additionalCronLimit) || additionalCronLimit < 0
+      || !Number.isInteger(maxConcurrentCronRuns) || maxConcurrentCronRuns < 1 || maxConcurrentCronRuns > 32
       || maxCronTotal !== defaultCronCount + additionalCronLimit) {
-    throw new Error('cron_policy must contain a valid default + additional = total policy');
+    throw new Error('cron_policy must contain valid quota and concurrency settings');
   }
   const cronLimitPluginPath = ensureCronLimitPlugin(paths);
 
@@ -826,6 +828,10 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
       auth: existing.gateway?.auth || { mode: 'token' },
     },
     session: existing.session || { dmScope: 'per-channel-peer' },
+    cron: {
+      ...(existing.cron || {}),
+      maxConcurrentRuns: maxConcurrentCronRuns,
+    },
     tools: existing.tools || { profile: 'coding' },
     plugins: {
       ...(existing.plugins || {}),
@@ -928,9 +934,11 @@ app.post('/clients/validate-provision', (req, res) => {
   const maxCronTotal = Number(config?.cron_policy?.max_total);
   const defaultCronCount = Number(config?.cron_policy?.default_count);
   const additionalCronLimit = Number(config?.cron_policy?.additional_limit);
+  const maxConcurrentCronRuns = Number(config?.cron_policy?.max_concurrent_runs);
   if (!Number.isInteger(maxCronTotal) || maxCronTotal < 0 || maxCronTotal > 500
       || !Number.isInteger(defaultCronCount) || defaultCronCount < 0
       || !Number.isInteger(additionalCronLimit) || additionalCronLimit < 0
+      || !Number.isInteger(maxConcurrentCronRuns) || maxConcurrentCronRuns < 1 || maxConcurrentCronRuns > 32
       || maxCronTotal !== defaultCronCount + additionalCronLimit) {
     errors.push('Invalid or missing config.cron_policy');
   }
@@ -1851,14 +1859,17 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
     max_total: existingCronPolicy.maxTotal,
     default_count: existingCronPolicy.defaultCount,
     additional_limit: existingCronPolicy.additionalLimit,
+    max_concurrent_runs: existing.cron?.maxConcurrentRuns,
   } : null);
   let cronLimitPluginPath = null;
   if (cronPolicy) {
     const maxTotal = Number(cronPolicy.max_total);
     const defaultCount = Number(cronPolicy.default_count);
     const additionalLimit = Number(cronPolicy.additional_limit);
+    const maxConcurrentRuns = Number(cronPolicy.max_concurrent_runs);
     if (!Number.isInteger(maxTotal) || !Number.isInteger(defaultCount)
         || !Number.isInteger(additionalLimit)
+        || !Number.isInteger(maxConcurrentRuns) || maxConcurrentRuns < 1 || maxConcurrentRuns > 32
         || maxTotal !== defaultCount + additionalLimit) {
       throw new Error('Managed client cron_policy is invalid');
     }
@@ -1897,6 +1908,12 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
       auth: { mode: 'token', token },
     },
     session: { dmScope: 'per-channel-peer' },
+    ...(cronPolicy ? {
+      cron: {
+        ...(existing.cron || {}),
+        maxConcurrentRuns: Number(cronPolicy.max_concurrent_runs),
+      },
+    } : {}),
     tools: existing.tools || { profile: 'coding' },
     plugins: {
       allow: ['openai', 'whatsapp', ...(cronLimitPluginPath ? ['heyurassistant-cron-limit'] : [])],
