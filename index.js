@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
+const { DatabaseSync } = require('node:sqlite');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -41,6 +42,11 @@ const DISK_EMERGENCY_PERCENT = Number(process.env.DISK_EMERGENCY_PERCENT || 95);
 const DISK_MONITOR_INTERVAL_MS = Number(process.env.DISK_MONITOR_INTERVAL_MS || 300000);
 const DISK_ALERT_REMINDER_MS = Number(process.env.DISK_ALERT_REMINDER_MS || 21600000);
 const DISK_HEALTH_STATE_FILE = '/root/.openclaw/disk-health.json';
+const CRON_HEALTH_MONITOR_INTERVAL_MS = Number(process.env.CRON_HEALTH_MONITOR_INTERVAL_MS || 60000);
+const CRON_HEALTH_LATE_GRACE_MS = Number(process.env.CRON_HEALTH_LATE_GRACE_MS || 300000);
+const CRON_HEALTH_STUCK_MS = Number(process.env.CRON_HEALTH_STUCK_MS || 900000);
+const CRON_HEALTH_ALERT_REMINDER_MS = Number(process.env.CRON_HEALTH_ALERT_REMINDER_MS || 21600000);
+const CRON_HEALTH_STATE_FILE = '/root/.openclaw/cron-health.json';
 
 function sendTelegram(text) {
   const body = JSON.stringify({ chat_id: TELEGRAM_CHAT, text, parse_mode: 'HTML' });
@@ -53,6 +59,13 @@ function sendTelegram(text) {
   req.on('error', () => {});
   req.write(body);
   req.end();
+}
+
+function escapeTelegramHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
 }
 
 const WORKSPACE_FILES = new Set([
@@ -212,6 +225,156 @@ function monitorDisk() {
     first_seen_at: firstSeenAt,
     last_checked_at: new Date().toISOString(),
     last_alert_at_ms: lastAlertAtMs,
+  });
+}
+
+function cronRuntimeSources() {
+  const sources = [];
+  for (const name of discoverClients()) {
+    const paths = clientPaths(name);
+    sources.push({ key: `client:${name}`, label: name, stateDir: paths.stateDir });
+  }
+
+  const managedRoot = '/root/.openclaw/managed-accounts';
+  if (fs.existsSync(managedRoot)) {
+    for (const entry of fs.readdirSync(managedRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^[0-9]+$/.test(entry.name)) continue;
+      sources.push({
+        key: `managed:${entry.name}`,
+        label: `managed-${entry.name}`,
+        stateDir: path.join(managedRoot, entry.name),
+      });
+    }
+  }
+
+  return sources.filter((source, index, all) =>
+    all.findIndex((candidate) => candidate.stateDir === source.stateDir) === index
+  );
+}
+
+function readCronHealthRows(source) {
+  const databasePath = path.join(source.stateDir, 'state', 'openclaw.sqlite');
+  if (!fs.existsSync(databasePath)) return [];
+  const database = new DatabaseSync(databasePath, { open: true, readOnly: true });
+  try {
+    return database.prepare(
+      `SELECT job_id, name, next_run_at_ms, running_at_ms, last_run_at_ms,
+              last_run_status, last_error, last_duration_ms, consecutive_errors,
+              consecutive_skipped, last_delivery_status, last_delivery_error
+       FROM cron_jobs
+       WHERE enabled = 1`,
+    ).all();
+  } finally {
+    database.close();
+  }
+}
+
+function cronHealthIssue(row, now) {
+  const runningAt = Number(row.running_at_ms || 0);
+  if (runningAt > 0 && now - runningAt > CRON_HEALTH_STUCK_MS) {
+    return {
+      kind: 'stuck',
+      fingerprint: `stuck:${runningAt}`,
+      detail: `masih berjalan selama ${Math.floor((now - runningAt) / 60000)} menit`,
+    };
+  }
+
+  const nextRunAt = Number(row.next_run_at_ms || 0);
+  if (!runningAt && nextRunAt > 0 && now - nextRunAt > CRON_HEALTH_LATE_GRACE_MS) {
+    return {
+      kind: 'late',
+      fingerprint: `late:${nextRunAt}`,
+      detail: `terlambat ${Math.floor((now - nextRunAt) / 60000)} menit`,
+    };
+  }
+
+  const runStatus = String(row.last_run_status || '').toLowerCase();
+  if (runStatus && !['ok', 'success'].includes(runStatus)) {
+    const error = String(row.last_error || runStatus).slice(0, 300);
+    return {
+      kind: 'execution_failed',
+      fingerprint: `execution:${Number(row.last_run_at_ms || 0)}:${runStatus}`,
+      detail: error,
+    };
+  }
+
+  const deliveryStatus = String(row.last_delivery_status || '').toLowerCase();
+  if (['failed', 'error'].includes(deliveryStatus)) {
+    const error = String(row.last_delivery_error || deliveryStatus).slice(0, 300);
+    return {
+      kind: 'delivery_failed',
+      fingerprint: `delivery:${Number(row.last_run_at_ms || 0)}:${deliveryStatus}`,
+      detail: error,
+    };
+  }
+
+  return null;
+}
+
+function monitorCronHealth() {
+  const now = Date.now();
+  const previous = readJsonFile(CRON_HEALTH_STATE_FILE, { issues: {} });
+  const previousIssues = previous.issues && typeof previous.issues === 'object' ? previous.issues : {};
+  const currentIssues = {};
+  const scannedSources = [];
+
+  for (const source of cronRuntimeSources()) {
+    try {
+      const rows = readCronHealthRows(source);
+      scannedSources.push(source.key);
+      for (const row of rows) {
+        const issue = cronHealthIssue(row, now);
+        if (!issue) continue;
+        const key = `${source.key}:${row.job_id}`;
+        const old = previousIssues[key] || {};
+        const isNew = old.fingerprint !== issue.fingerprint;
+        const reminderDue = now - Number(old.last_alert_at_ms || 0) >= CRON_HEALTH_ALERT_REMINDER_MS;
+        let lastAlertAtMs = Number(old.last_alert_at_ms || 0);
+
+        if (isNew || reminderDue) {
+          sendTelegram(
+            `🚨 <b>Cron ${escapeTelegramHtml(issue.kind)}</b>\n`
+            + `Host: <code>${escapeTelegramHtml(os.hostname())}</code>\n`
+            + `Runtime: <code>${escapeTelegramHtml(source.label)}</code>\n`
+            + `Job: <code>${escapeTelegramHtml(row.name)}</code>\n`
+            + `Detail: <code>${escapeTelegramHtml(issue.detail)}</code>\n`
+            + `Consecutive errors: <code>${Number(row.consecutive_errors || 0)}</code>`,
+          );
+          lastAlertAtMs = now;
+        }
+
+        currentIssues[key] = {
+          source: source.key,
+          runtime: source.label,
+          job_id: String(row.job_id),
+          job_name: String(row.name),
+          kind: issue.kind,
+          fingerprint: issue.fingerprint,
+          first_seen_at: isNew ? new Date(now).toISOString() : (old.first_seen_at || new Date(now).toISOString()),
+          last_seen_at: new Date(now).toISOString(),
+          last_alert_at_ms: lastAlertAtMs,
+        };
+      }
+    } catch (error) {
+      console.error(`Cron health scan failed for ${source.key}: ${error.message}`);
+    }
+  }
+
+  for (const [key, old] of Object.entries(previousIssues)) {
+    if (currentIssues[key] || !scannedSources.includes(old.source)) continue;
+    sendTelegram(
+      `✅ <b>Cron pulih</b>\n`
+      + `Host: <code>${escapeTelegramHtml(os.hostname())}</code>\n`
+      + `Runtime: <code>${escapeTelegramHtml(old.runtime)}</code>\n`
+      + `Job: <code>${escapeTelegramHtml(old.job_name)}</code>\n`
+      + `Masalah sebelumnya: <code>${escapeTelegramHtml(old.kind)}</code>`,
+    );
+  }
+
+  writeJsonFileAtomic(CRON_HEALTH_STATE_FILE, {
+    issues: currentIssues,
+    scanned_sources: scannedSources,
+    last_checked_at: new Date(now).toISOString(),
   });
 }
 
@@ -2650,17 +2813,27 @@ app.post('/model-pool/:accountId/backups/:backupName/restore', (req, res) => {
   }
 });
 
-app.listen(PORT, HOST, () => {
-  console.log(`OpenClaw API Server running on ${HOST}:${PORT}`);
-  recoverInterruptedModelPoolJobs();
-  setTimeout(() => {
-    try { monitorDisk(); } catch {}
-  }, 3000);
-  setInterval(() => {
-    try { monitorDisk(); } catch {}
-  }, DISK_MONITOR_INTERVAL_MS);
-  setTimeout(() => monitorManagedWhatsApp().catch(() => {}), 5000);
-  setInterval(() => monitorManagedWhatsApp().catch(() => {}), 60000);
-  setTimeout(() => monitorModelPools().catch(() => {}), 15000);
-  setInterval(() => monitorModelPools().catch(() => {}), 300000);
-});
+if (require.main === module) {
+  app.listen(PORT, HOST, () => {
+    console.log(`OpenClaw API Server running on ${HOST}:${PORT}`);
+    recoverInterruptedModelPoolJobs();
+    setTimeout(() => {
+      try { monitorDisk(); } catch {}
+    }, 3000);
+    setInterval(() => {
+      try { monitorDisk(); } catch {}
+    }, DISK_MONITOR_INTERVAL_MS);
+    setTimeout(() => {
+      try { monitorCronHealth(); } catch (error) { console.error(`Cron health monitor failed: ${error.message}`); }
+    }, 10000);
+    setInterval(() => {
+      try { monitorCronHealth(); } catch (error) { console.error(`Cron health monitor failed: ${error.message}`); }
+    }, CRON_HEALTH_MONITOR_INTERVAL_MS);
+    setTimeout(() => monitorManagedWhatsApp().catch(() => {}), 5000);
+    setInterval(() => monitorManagedWhatsApp().catch(() => {}), 60000);
+    setTimeout(() => monitorModelPools().catch(() => {}), 15000);
+    setInterval(() => monitorModelPools().catch(() => {}), 300000);
+  });
+}
+
+module.exports = { cronHealthIssue };
