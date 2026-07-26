@@ -4,6 +4,7 @@ const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const os = require('os');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -17,6 +18,7 @@ const OPENCLAW_BIN = '/root/.nvm/versions/node/v22.22.0/lib/node_modules/opencla
 const CLAUDE_BIN = '/root/.nvm/versions/node/v22.22.0/bin/claude';
 const WHATSAPP_PLUGIN_SPEC = '@openclaw/whatsapp@2026.5.27';
 const MODEL_POOL_SCRIPT = path.join(__dirname, 'chatgpt-pool-store.py');
+const CRON_LIMIT_PLUGIN_SOURCE = path.join(__dirname, 'plugins', 'cron-limit');
 const managedLoginSessions = new Map();
 const modelPoolLoginSessions = new Map();
 const modelPoolSyncJobs = new Map();
@@ -32,6 +34,13 @@ const managedRuntimeChecks = new Map(
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8731741557:AAFjdZjoXrcCdZPTHiJFjCjuo2ZRtOYP8YE';
 const TELEGRAM_CHAT  = process.env.TELEGRAM_CHAT_ID  || '652689793';
+const DISK_MONITOR_PATH = process.env.DISK_MONITOR_PATH || '/';
+const DISK_WARNING_PERCENT = Number(process.env.DISK_WARNING_PERCENT || 80);
+const DISK_CRITICAL_PERCENT = Number(process.env.DISK_CRITICAL_PERCENT || 90);
+const DISK_EMERGENCY_PERCENT = Number(process.env.DISK_EMERGENCY_PERCENT || 95);
+const DISK_MONITOR_INTERVAL_MS = Number(process.env.DISK_MONITOR_INTERVAL_MS || 300000);
+const DISK_ALERT_REMINDER_MS = Number(process.env.DISK_ALERT_REMINDER_MS || 21600000);
+const DISK_HEALTH_STATE_FILE = '/root/.openclaw/disk-health.json';
 
 function sendTelegram(text) {
   const body = JSON.stringify({ chat_id: TELEGRAM_CHAT, text, parse_mode: 'HTML' });
@@ -94,14 +103,18 @@ function sleepSync(ms) {
 
 function execOpenClawAfterGatewayReady(args, options = {}) {
   let lastError;
-  for (let attempt = 1; attempt <= 8; attempt += 1) {
+  // A full OpenClaw config reload can take 25-30 seconds on the shared VPS.
+  // Keep retrying transient websocket startup failures within the caller's
+  // 60-second HTTP budget instead of failing cron sync after only 16 seconds.
+  const maxAttempts = 20;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       return execFileSync(NODE_BIN, [OPENCLAW_BIN, ...args], options);
     } catch (error) {
       lastError = error;
       const detail = String(error.stderr || error.message || '');
       const transient = /1006|ECONNREFUSED|not yet ready|closed before connect/i.test(detail);
-      if (!transient || attempt === 8) throw error;
+      if (!transient || attempt === maxAttempts) throw error;
       sleepSync(2000);
     }
   }
@@ -115,6 +128,116 @@ function readJsonFile(file, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function writeJsonFileAtomic(file, value) {
+  const temporary = `${file}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporary, file);
+}
+
+function formatBytes(value) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let amount = Number(value);
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  return `${amount.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function diskAlertLevel(percent) {
+  if (percent >= DISK_EMERGENCY_PERCENT) return 'emergency';
+  if (percent >= DISK_CRITICAL_PERCENT) return 'critical';
+  if (percent >= DISK_WARNING_PERCENT) return 'warning';
+  return 'healthy';
+}
+
+function monitorDisk() {
+  const stats = fs.statfsSync(DISK_MONITOR_PATH, { bigint: true });
+  const totalBytes = stats.bsize * stats.blocks;
+  const availableBytes = stats.bsize * stats.bavail;
+  const usedBytes = totalBytes - availableBytes;
+  const usagePercent = totalBytes > 0n ? Number((usedBytes * 1000n) / totalBytes) / 10 : 0;
+  const inodeUsagePercent = stats.files > 0n
+    ? Number(((stats.files - stats.ffree) * 1000n) / stats.files) / 10
+    : 0;
+  const pressurePercent = Math.max(usagePercent, inodeUsagePercent);
+  const level = diskAlertLevel(pressurePercent);
+  const now = Date.now();
+  const previous = readJsonFile(DISK_HEALTH_STATE_FILE, {
+    level: 'healthy',
+    last_alert_at_ms: 0,
+    first_seen_at: null,
+  });
+  const changed = previous.level !== level;
+  const reminderDue = level !== 'healthy'
+    && now - Number(previous.last_alert_at_ms || 0) >= DISK_ALERT_REMINDER_MS;
+  let lastAlertAtMs = Number(previous.last_alert_at_ms || 0);
+  let firstSeenAt = previous.first_seen_at || null;
+
+  if (level === 'healthy' && previous.level !== 'healthy') {
+    sendTelegram(
+      `✅ <b>Disk host pulih</b>\n`
+      + `Host: <code>${os.hostname()}</code>\n`
+      + `Mount: <code>${DISK_MONITOR_PATH}</code>\n`
+      + `Disk: <code>${usagePercent.toFixed(1)}%</code> (${formatBytes(availableBytes)} tersedia)\n`
+      + `Inode: <code>${inodeUsagePercent.toFixed(1)}%</code>`,
+    );
+    lastAlertAtMs = now;
+    firstSeenAt = null;
+  } else if (level !== 'healthy' && (changed || reminderDue)) {
+    const icon = level === 'emergency' ? '🆘' : (level === 'critical' ? '🚨' : '⚠️');
+    if (changed || !firstSeenAt) firstSeenAt = new Date().toISOString();
+    sendTelegram(
+      `${icon} <b>Disk ${level.toUpperCase()}</b>\n`
+      + `Host: <code>${os.hostname()}</code>\n`
+      + `Mount: <code>${DISK_MONITOR_PATH}</code>\n`
+      + `Disk: <code>${usagePercent.toFixed(1)}%</code> (${formatBytes(availableBytes)} tersedia)\n`
+      + `Inode: <code>${inodeUsagePercent.toFixed(1)}%</code>\n`
+      + `Threshold: warning ${DISK_WARNING_PERCENT}% · critical ${DISK_CRITICAL_PERCENT}% · emergency ${DISK_EMERGENCY_PERCENT}%\n`
+      + `Cleanup otomatis: <code>disabled</code>`,
+    );
+    lastAlertAtMs = now;
+  }
+
+  writeJsonFileAtomic(DISK_HEALTH_STATE_FILE, {
+    level,
+    path: DISK_MONITOR_PATH,
+    usage_percent: usagePercent,
+    inode_usage_percent: inodeUsagePercent,
+    total_bytes: totalBytes.toString(),
+    available_bytes: availableBytes.toString(),
+    first_seen_at: firstSeenAt,
+    last_checked_at: new Date().toISOString(),
+    last_alert_at_ms: lastAlertAtMs,
+  });
+}
+
+function removeLegacyGeneratedAgentsPolicy(content) {
+  const normalized = String(content || '').trim();
+  if (!normalized) return '';
+
+  // Old backend-generated AGENTS.md files are policy snapshots, not user
+  // memory. They remain recoverable in workspace-backups, but must not stay in
+  // the active prompt after a plan upgrade because stale plan/cron limits can
+  // conflict with the new authoritative managed block.
+  const generatedPolicyMarkers = [
+    '# Kemampuan Agent',
+    'Paket:',
+    'Cron bawaan:',
+    'Cron tambahan:',
+    '## Asisten Aktif',
+    '## Kemampuan Umum',
+    '# Batas Akses Direktori',
+    '# Kebijakan',
+  ];
+  if (generatedPolicyMarkers.every((marker) => normalized.includes(marker))) {
+    return '';
+  }
+
+  return normalized;
 }
 
 function normalizePhone(value) {
@@ -557,6 +680,20 @@ function chownTreeIfHome(paths, target) {
   }
 }
 
+function ensureCronLimitPlugin(paths) {
+  const target = path.join(paths.stateDir, 'managed-plugins', 'cron-limit');
+  fs.mkdirSync(target, { recursive: true });
+  for (const file of ['package.json', 'openclaw.plugin.json', 'index.js', 'policy.js']) {
+    const destination = path.join(target, file);
+    fs.copyFileSync(path.join(CRON_LIMIT_PLUGIN_SOURCE, file), destination);
+    fs.chownSync(destination, 0, 0);
+    fs.chmodSync(destination, 0o644);
+  }
+  fs.chownSync(target, 0, 0);
+  fs.chmodSync(target, 0o755);
+  return target;
+}
+
 function discoverClients() {
   const names = new Set();
 
@@ -582,6 +719,7 @@ function extractClient(config, name) {
   const wa = config.channels?.whatsapp || {};
   const firstAgent = config.agents?.list?.[0] || {};
   const groupAllowFrom = wa.groupAllowFrom || [];
+  const configuredScope = config.meta?.scopePackage || config.meta?.scope_package;
 
   return {
     name,
@@ -590,7 +728,10 @@ function extractClient(config, name) {
       ? (whatsappSessionIdentity(path.join(paths.stateDir, 'credentials/whatsapp/default')).session_phone || '')
       : (wa.allowFrom?.[0] || ''),
     port: config.gateway?.port,
-    scope_package: groupAllowFrom.includes('*') ? 'team' : 'personal',
+    scope_package: ['personal', 'team'].includes(configuredScope)
+      ? configuredScope
+      : (groupAllowFrom.includes('*') ? 'team' : 'personal'),
+    plan: config.meta?.plan || null,
     assistant_type: config.meta?.assistantType || config.meta?.assistant_type || 'custom',
     service_status: getServiceStatus(name),
     layout: paths.layout,
@@ -624,6 +765,17 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
 
   const model = payload.primary_model || existing.agents?.defaults?.model?.primary || 'openai/gpt-5.5';
   const fallbacks = Array.isArray(payload.fallback_models) ? payload.fallback_models : [];
+  const cronPolicy = payload.cron_policy || {};
+  const maxCronTotal = Number(cronPolicy.max_total);
+  const defaultCronCount = Number(cronPolicy.default_count);
+  const additionalCronLimit = Number(cronPolicy.additional_limit);
+  if (!Number.isInteger(maxCronTotal) || maxCronTotal < 0 || maxCronTotal > 500
+      || !Number.isInteger(defaultCronCount) || defaultCronCount < 0
+      || !Number.isInteger(additionalCronLimit) || additionalCronLimit < 0
+      || maxCronTotal !== defaultCronCount + additionalCronLimit) {
+    throw new Error('cron_policy must contain a valid default + additional = total policy');
+  }
+  const cronLimitPluginPath = ensureCronLimitPlugin(paths);
 
   const next = {
     ...existingConfig,
@@ -677,12 +829,25 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
     tools: existing.tools || { profile: 'coding' },
     plugins: {
       ...(existing.plugins || {}),
-      allow: [...new Set([...(existing.plugins?.allow || []), 'openai', 'whatsapp'])],
+      allow: [...new Set([...(existing.plugins?.allow || []), 'openai', 'whatsapp', 'heyurassistant-cron-limit'])],
       bundledDiscovery: 'compat',
+      load: {
+        ...(existing.plugins?.load || {}),
+        paths: [...new Set([...(existing.plugins?.load?.paths || []), cronLimitPluginPath])],
+      },
       entries: {
         ...(existing.plugins?.entries || {}),
         openai: { enabled: true },
         whatsapp: { enabled: true },
+        'heyurassistant-cron-limit': {
+          enabled: true,
+          config: {
+            maxTotal: maxCronTotal,
+            defaultCount: defaultCronCount,
+            additionalLimit: additionalCronLimit,
+            stateDir: paths.stateDir,
+          },
+        },
       },
     },
   };
@@ -759,6 +924,15 @@ app.post('/clients/validate-provision', (req, res) => {
     if (!isAllowedWorkspaceFile(file)) errors.push(`Unsupported workspace file: ${file}`);
   }
   if (!config || typeof config !== 'object' || Array.isArray(config)) errors.push('config must be an object');
+  const maxCronTotal = Number(config?.cron_policy?.max_total);
+  const defaultCronCount = Number(config?.cron_policy?.default_count);
+  const additionalCronLimit = Number(config?.cron_policy?.additional_limit);
+  if (!Number.isInteger(maxCronTotal) || maxCronTotal < 0 || maxCronTotal > 500
+      || !Number.isInteger(defaultCronCount) || defaultCronCount < 0
+      || !Number.isInteger(additionalCronLimit) || additionalCronLimit < 0
+      || maxCronTotal !== defaultCronCount + additionalCronLimit) {
+    errors.push('Invalid or missing config.cron_policy');
+  }
   if (wa_mode === 'client_number_bot' && config && typeof config === 'object') {
     const plan = config.plan;
     const expectedDm = plan === 'pro' ? 'allowlist' : 'disabled';
@@ -780,6 +954,9 @@ app.post('/clients/validate-provision', (req, res) => {
     if (!/^\S+(\s+\S+){4}$/.test(String(cron.schedule || ''))) errors.push(`Invalid cron schedule: ${cron.slug || ''}`);
     if (!cron.message || typeof cron.message !== 'string') errors.push(`Missing cron message: ${cron.slug || ''}`);
     if (cron.enabled !== false) errors.push(`Cron must start disabled: ${cron.slug || ''}`);
+  }
+  if (Array.isArray(crons) && Number.isInteger(defaultCronCount) && crons.length !== defaultCronCount) {
+    errors.push(`Default cron count does not match policy: ${crons.length}/${defaultCronCount}`);
   }
 
   res.status(errors.length ? 422 : 200).json({
@@ -943,6 +1120,9 @@ app.post('/clients/:name/workspace', (req, res) => {
   if (!getClientConfig(name)) return res.status(404).json({ ok: false, error: 'Client not found' });
 
   const files = req.body?.files;
+  const preserveExisting = req.body?.preserve_existing !== false;
+  const overwriteFiles = new Set(Array.isArray(req.body?.overwrite_files) ? req.body.overwrite_files : []);
+  const mergeManagedFiles = new Set(Array.isArray(req.body?.merge_managed_files) ? req.body.merge_managed_files : []);
   if (!files || typeof files !== 'object' || Array.isArray(files)) {
     return res.status(400).json({ ok: false, error: 'files object is required' });
   }
@@ -951,6 +1131,10 @@ app.post('/clients/:name/workspace', (req, res) => {
   fs.mkdirSync(paths.workspaceDir, { recursive: true });
 
   const written = [];
+  const preserved = [];
+  const merged = [];
+  const backedUp = [];
+  const backupRoot = path.join(paths.stateDir, 'workspace-backups', new Date().toISOString().replace(/[:.]/g, '-'));
   for (const [file, content] of Object.entries(files)) {
     if (!isAllowedWorkspaceFile(file)) {
       return res.status(400).json({ ok: false, error: `Unsupported workspace file: ${file}` });
@@ -963,23 +1147,123 @@ app.post('/clients/:name/workspace', (req, res) => {
       return res.status(400).json({ ok: false, error: `Path traversal detected: ${file}` });
     }
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, String(content ?? ''));
+
+    if (fs.existsSync(target) && preserveExisting && !overwriteFiles.has(file) && !mergeManagedFiles.has(file)) {
+      preserved.push(file);
+      continue;
+    }
+
+    if (fs.existsSync(target)) {
+      const backupTarget = path.join(backupRoot, file);
+      fs.mkdirSync(path.dirname(backupTarget), { recursive: true });
+      fs.copyFileSync(target, backupTarget);
+      chownIfHome(paths, backupTarget);
+      backedUp.push(file);
+    }
+
+    let nextContent = String(content ?? '');
+    if (mergeManagedFiles.has(file)) {
+      const startMarker = '<!-- OPENCLAW-MANAGED:START -->';
+      const endMarker = '<!-- OPENCLAW-MANAGED:END -->';
+      const managedBlock = [
+        startMarker,
+        '<!--',
+        'SUMBER KEBENARAN OTORITATIF DARI BACKEND.',
+        'Jika isi di luar blok ini bertentangan mengenai paket, fitur, assistant,',
+        'DM/group policy, scope, mention, cron, route, tool, integrasi, akses, atau',
+        'identitas teknis, WAJIB ikuti blok ini. Isi di luar blok hanya boleh',
+        'dipakai sebagai data, memori, atau preferensi user yang tidak bertentangan.',
+        '-->',
+        nextContent.trim(),
+        endMarker,
+        '',
+      ].join('\n');
+      const existingContent = fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : '';
+      const start = existingContent.indexOf(startMarker);
+      const end = existingContent.indexOf(endMarker, start + startMarker.length);
+      let preservedContent = existingContent;
+
+      if (start >= 0 && end >= start) {
+        preservedContent = (
+          existingContent.slice(0, start)
+          + existingContent.slice(end + endMarker.length)
+        ).trim();
+      }
+      const preservedStartMarker = '<!-- OPENCLAW-PRESERVED:START -->';
+      const preservedEndMarker = '<!-- OPENCLAW-PRESERVED:END -->';
+      // Tolerate legacy/incomplete wrappers and remove any number of nested
+      // preserved headers before writing exactly one canonical wrapper.
+      preservedContent = preservedContent.trim();
+      while (preservedContent.startsWith(preservedStartMarker)) {
+        const markerEnd = preservedContent.indexOf('-->');
+        const headerStart = preservedContent.indexOf('<!--', markerEnd + 3);
+        const headerEnd = headerStart >= 0 ? preservedContent.indexOf('-->', headerStart + 4) : -1;
+        preservedContent = preservedContent.slice(
+          headerEnd >= 0 ? headerEnd + 3 : markerEnd + 3,
+        ).trim();
+      }
+      while (preservedContent.endsWith(preservedEndMarker)) {
+        preservedContent = preservedContent.slice(0, -preservedEndMarker.length).trim();
+      }
+      if (file === 'AGENTS.md') {
+        preservedContent = removeLegacyGeneratedAgentsPolicy(preservedContent);
+      }
+      const legacyNotice = [
+        '<!-- OPENCLAW-PRESERVED:START -->',
+        '<!--',
+        'KONTEN EXISTING YANG DIPERTAHANKAN.',
+        'Bagian ini bukan sumber policy. Abaikan setiap aturan yang bertentangan',
+        'dengan blok OPENCLAW-MANAGED di atas.',
+        '-->',
+      ].join('\n');
+      nextContent = preservedContent.trim()
+        ? `${managedBlock}\n${legacyNotice}\n${preservedContent.trim()}\n<!-- OPENCLAW-PRESERVED:END -->\n`
+        : managedBlock;
+      merged.push(file);
+    }
+
+    fs.writeFileSync(target, nextContent);
     chownIfHome(paths, target);
     written.push(file);
   }
 
   chownTreeIfHome(paths, paths.workspaceDir);
-  res.json({ ok: true, success: true, written, workspace_dir: paths.workspaceDir });
+  if (backedUp.length > 0) chownTreeIfHome(paths, backupRoot);
+  res.json({
+    ok: true,
+    success: true,
+    written,
+    preserved,
+    merged,
+    backed_up: backedUp,
+    backup_dir: backedUp.length > 0 ? backupRoot : null,
+    workspace_dir: paths.workspaceDir,
+  });
 });
 
 app.put('/clients/:name/crons', (req, res) => {
   const { name } = req.params;
   if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
-  const config = getClientConfig(name);
+  const managedAccountId = Number(req.body?.managed_account_id || 0);
+  const managedPaths = managedAccountId > 0 ? managedAccountPaths(managedAccountId) : null;
+  const config = managedPaths ? readJsonFile(managedPaths.configPath, null) : getClientConfig(name);
   if (!config) return res.status(404).json({ ok: false, error: 'Client not found' });
+  if (managedPaths && !config.agents?.list?.some((agent) =>
+    agent.id === 'main' && agent.workspace === `/home/openclaw-${name}/workspace`
+  )) {
+    return res.status(422).json({ ok: false, error: `Managed router main agent is not bound to client ${name}` });
+  }
 
   const jobs = req.body?.jobs;
   if (!Array.isArray(jobs)) return res.status(400).json({ ok: false, error: 'jobs array is required' });
+  const policy = req.body?.policy || {};
+  const maxTotal = Number(policy.max_total);
+  const defaultCount = Number(policy.default_count);
+  const additionalLimit = Number(policy.additional_limit);
+  if (!Number.isInteger(maxTotal) || !Number.isInteger(defaultCount) || !Number.isInteger(additionalLimit)
+      || maxTotal !== defaultCount + additionalLimit || jobs.length !== defaultCount) {
+    return res.status(422).json({ ok: false, error: 'Invalid cron policy or default job count' });
+  }
 
   const errors = [];
   for (const job of jobs) {
@@ -994,40 +1278,64 @@ app.put('/clients/:name/crons', (req, res) => {
   const token = config.gateway?.auth?.token;
   if (!port || !token) return res.status(422).json({ ok: false, error: 'Gateway port/token missing' });
   const connection = ['--url', `ws://127.0.0.1:${port}`, '--token', token];
+  const cronExecOptions = { encoding: 'utf8', timeout: 30000, ...(managedPaths ? { env: openClawEnv(managedPaths) } : {}) };
 
   try {
-    const raw = execOpenClawAfterGatewayReady(['cron', 'list', '--json', ...connection], {
-      encoding: 'utf8', timeout: 30000,
-    });
+    const raw = execOpenClawAfterGatewayReady(['cron', 'list', '--all', '--json', ...connection], cronExecOptions);
     const parsed = JSON.parse(raw || '{}');
     const existingJobs = Array.isArray(parsed) ? parsed : (parsed.jobs || []);
+    const jobName = (slug) => managedPaths ? `${name}__${slug}` : slug;
     const existingByName = new Map(existingJobs.map((job) => [job.name, job]));
+    const scopedExisting = managedPaths
+      ? existingJobs.filter((job) => String(job.name || '').startsWith(`${name}__`))
+      : existingJobs;
+    const newDefaultCount = jobs.filter((job) => !existingByName.has(jobName(job.slug))).length;
+    if (scopedExisting.length + newDefaultCount > maxTotal) {
+      return res.status(409).json({
+        ok: false,
+        error: `Cron policy exceeded: ${scopedExisting.length} existing + ${newDefaultCount} new > ${maxTotal}`,
+      });
+    }
     const created = [];
     const existing = [];
+    const unchanged = [];
 
     for (const job of jobs) {
-      if (existingByName.has(job.slug)) {
-        const current = existingByName.get(job.slug);
+      const persistedName = jobName(job.slug);
+      const cronAgent = managedPaths ? 'main' : (job.agent || 'main');
+      if (existingByName.has(persistedName)) {
+        const current = existingByName.get(persistedName);
         if (!current.id) throw new Error(`Existing cron has no id: ${job.slug}`);
+        const alreadySynced = current.agentId === cronAgent
+          && current.schedule?.kind === 'cron'
+          && current.schedule?.expr === job.schedule
+          && current.schedule?.tz === (job.timezone || 'Asia/Jakarta')
+          && current.sessionTarget === (job.session || 'isolated')
+          && current.payload?.message === job.message;
+        if (alreadySynced) {
+          existing.push(persistedName);
+          unchanged.push(persistedName);
+          continue;
+        }
         execFileSync(NODE_BIN, [
           OPENCLAW_BIN, 'cron', 'edit', current.id,
           '--cron', job.schedule, '--tz', job.timezone || 'Asia/Jakarta',
-          '--agent', job.agent || 'main', '--session', job.session || 'isolated',
+          '--agent', cronAgent, '--session', job.session || 'isolated',
           '--message', job.message, '--disable', '--no-deliver', ...connection,
-        ], { encoding: 'utf8', timeout: 30000 });
-        existing.push(job.slug);
+        ], cronExecOptions);
+        existing.push(persistedName);
         continue;
       }
       execFileSync(NODE_BIN, [
-        OPENCLAW_BIN, 'cron', 'add', '--json', '--name', job.slug,
+        OPENCLAW_BIN, 'cron', 'add', '--json', '--name', persistedName,
         '--cron', job.schedule, '--tz', job.timezone || 'Asia/Jakarta',
-        '--agent', job.agent || 'main', '--session', job.session || 'isolated',
+        '--agent', cronAgent, '--session', job.session || 'isolated',
         '--message', job.message, '--disabled', '--no-deliver', ...connection,
-      ], { encoding: 'utf8', timeout: 30000 });
-      created.push(job.slug);
+      ], cronExecOptions);
+      created.push(persistedName);
     }
 
-    res.json({ ok: true, success: true, created, existing, enabled: 0 });
+    res.json({ ok: true, success: true, created, existing, unchanged, enabled: 0 });
   } catch (error) {
     res.status(500).json({ ok: false, error: 'Cron sync failed', detail: String(error.stderr || error.message || '').trim() });
   }
@@ -1132,29 +1440,64 @@ app.post('/clients/:name/verify-prerequisites', (req, res) => {
   res.status(result.ok ? 200 : 422).json(result);
 });
 
-app.post('/clients/:name/crons/activate', (req, res) => {
+app.post('/clients/:name/crons/activate', async (req, res) => {
   const { name } = req.params;
   if (!validName(name)) return res.status(400).json({ ok: false, error: 'Invalid name' });
-  const config = getClientConfig(name);
+  const managedAccountId = Number(req.body?.managed_account_id || 0);
+  const managedPaths = managedAccountId > 0 ? managedAccountPaths(managedAccountId) : null;
+  const config = managedPaths ? readJsonFile(managedPaths.configPath, null) : getClientConfig(name);
   if (!config) return res.status(404).json({ ok: false, error: 'Client not found' });
   const jobs = req.body?.jobs;
-  const target = String(req.body?.target || '');
-  if (!Array.isArray(jobs) || !target) return res.status(422).json({ ok: false, error: 'jobs and delivery target are required' });
-  if (!/^120[0-9]+@g\.us$/.test(target) && !/^\+[1-9][0-9]{6,14}$/.test(target)) {
-    return res.status(422).json({ ok: false, error: 'Invalid WhatsApp delivery target' });
+  const targets = req.body?.targets;
+  if (!Array.isArray(jobs) || !targets || typeof targets !== 'object') {
+    return res.status(422).json({ ok: false, error: 'jobs and assistant delivery targets are required' });
   }
+  const validTarget = (target) => /^120[0-9]+@g\.us$/.test(target) || /^\+[1-9][0-9]{6,14}$/.test(target);
+  const invalidJob = jobs.find((job) => !job.assistant_slot || !validTarget(String(targets[job.assistant_slot] || '')));
+  if (invalidJob) return res.status(422).json({ ok: false, error: `Missing or invalid WhatsApp target for assistant slot ${invalidJob.assistant_slot || '?'}` });
   const connection = ['--url', `ws://127.0.0.1:${config.gateway?.port}`, '--token', config.gateway?.auth?.token];
+  const cronExecOptions = { encoding: 'utf8', timeout: 30000, ...(managedPaths ? { env: openClawEnv(managedPaths) } : {}) };
   try {
-    const raw = execOpenClawAfterGatewayReady(['cron', 'list', '--json', ...connection], { encoding: 'utf8', timeout: 30000 });
+    const raw = execOpenClawAfterGatewayReady(['cron', 'list', '--all', '--json', ...connection], cronExecOptions);
     const existing = Array.isArray(JSON.parse(raw)) ? JSON.parse(raw) : (JSON.parse(raw).jobs || []);
-    const requested = new Set(jobs.map((job) => job.slug));
+    const jobName = (slug) => managedPaths ? `${name}__${slug}` : slug;
+    const requested = new Set(jobs.map((job) => jobName(job.slug)));
+    const requestedJobs = new Map(jobs.map((job) => [jobName(job.slug), job]));
     const enabled = [];
+    const unchanged = [];
+    const edits = [];
     for (const job of existing) {
       if (!requested.has(job.name) || !job.id) continue;
-      execFileSync(NODE_BIN, [OPENCLAW_BIN, 'cron', 'edit', job.id, '--enable', '--announce', '--channel', 'whatsapp', '--to', target, ...connection], { encoding: 'utf8', timeout: 30000 });
-      enabled.push(job.name);
+      const requestedJob = requestedJobs.get(job.name);
+      const target = String(targets[requestedJob.assistant_slot]);
+      const activation = { name: job.name, assistant_slot: requestedJob.assistant_slot, target };
+      const alreadyActive = job.enabled === true
+        && job.delivery?.mode === 'announce'
+        && job.delivery?.channel === 'whatsapp'
+        && job.delivery?.to === target;
+      if (alreadyActive) {
+        enabled.push(activation);
+        unchanged.push(job.name);
+        continue;
+      }
+      edits.push(() => new Promise((resolve, reject) => {
+          execFile(
+            NODE_BIN,
+            [OPENCLAW_BIN, 'cron', 'edit', job.id, '--enable', '--announce', '--channel', 'whatsapp', '--to', target, ...connection],
+            cronExecOptions,
+            (error) => {
+              if (error) return reject(error);
+              enabled.push(activation);
+              resolve();
+            },
+          );
+        }));
     }
-    res.json({ ok: true, enabled, channel: 'whatsapp', target });
+    for (const edit of edits) await edit();
+    if (enabled.length !== requested.size) {
+      throw new Error(`Cron activation incomplete: enabled ${enabled.length}/${requested.size}. Run cron sync again before activation.`);
+    }
+    res.json({ ok: true, enabled, unchanged, channel: 'whatsapp', targets });
   } catch (error) {
     res.status(500).json({ ok: false, error: 'Cron activation failed', detail: String(error.stderr || error.message || '').slice(0, 1000) });
   }
@@ -1398,6 +1741,9 @@ function managedAccountPaths(accountId) {
   const base = `/root/.openclaw/managed-accounts/${accountId}`;
   return {
     base,
+    stateDir: base,
+    home: '/root',
+    codexHome: '/root/.codex',
     credsDir:  `${base}/credentials/whatsapp/default`,
     routesFile: `${base}/routes.json`,
     configPath: `${base}/openclaw.json`,
@@ -1440,7 +1786,10 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
   }
 
   const agents = [...clients.values()].map((route, index) => ({
-    id: route.client_name,
+    // A managed bot slot is exclusive to one client. Reuse that client's
+    // existing `main` agent database; OpenClaw rejects the database when the
+    // configured agent id differs from the id stored inside SQLite.
+    id: 'main',
     default: index === 0,
     name: route.client_name,
     workspace: route.agent_workspace,
@@ -1461,7 +1810,7 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
   }
 
   const groupBindings = routes.map((route) => ({
-    agentId: route.client_name,
+    agentId: 'main',
     comment: `Managed WA account ${accountId}, assistant slot ${route.assistant_slot || 1}`,
     match: {
       channel: 'whatsapp',
@@ -1471,7 +1820,7 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
   const dmBindings = dmClients
     .filter(client => client.client_name && client.owner_phone)
     .map(client => ({
-      agentId: client.client_name,
+    agentId: 'main',
       comment: `Managed WA account ${accountId}, owner-only personal DM`,
       match: {
         channel: 'whatsapp',
@@ -1495,6 +1844,25 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
   const allowEveryone = routes.some((route) => route.group_scope === 'everyone');
   const port = resolveManagedGatewayPort(accountId, account.gateway_port, existing.gateway?.port);
   const token = existing.gateway?.auth?.token || crypto.randomBytes(24).toString('hex');
+  const incomingCronPolicy = dmClients.find(client => client.cron_policy)?.cron_policy;
+  const existingCronPolicy = existing.plugins?.entries?.['heyurassistant-cron-limit']?.config;
+  const cronPolicy = incomingCronPolicy || (existingCronPolicy ? {
+    max_total: existingCronPolicy.maxTotal,
+    default_count: existingCronPolicy.defaultCount,
+    additional_limit: existingCronPolicy.additionalLimit,
+  } : null);
+  let cronLimitPluginPath = null;
+  if (cronPolicy) {
+    const maxTotal = Number(cronPolicy.max_total);
+    const defaultCount = Number(cronPolicy.default_count);
+    const additionalLimit = Number(cronPolicy.additional_limit);
+    if (!Number.isInteger(maxTotal) || !Number.isInteger(defaultCount)
+        || !Number.isInteger(additionalLimit)
+        || maxTotal !== defaultCount + additionalLimit) {
+      throw new Error('Managed client cron_policy is invalid');
+    }
+    cronLimitPluginPath = ensureCronLimitPlugin(paths);
+  }
 
   return {
     ...existingConfig,
@@ -1530,11 +1898,23 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
     session: { dmScope: 'per-channel-peer' },
     tools: existing.tools || { profile: 'coding' },
     plugins: {
-      allow: ['openai', 'whatsapp'],
+      allow: ['openai', 'whatsapp', ...(cronLimitPluginPath ? ['heyurassistant-cron-limit'] : [])],
       bundledDiscovery: 'compat',
+      ...(cronLimitPluginPath ? { load: { paths: [cronLimitPluginPath] } } : {}),
       entries: {
         openai: { enabled: true },
         whatsapp: { enabled: true },
+        ...(cronLimitPluginPath ? {
+          'heyurassistant-cron-limit': {
+            enabled: true,
+            config: {
+              maxTotal: Number(cronPolicy.max_total),
+              defaultCount: Number(cronPolicy.default_count),
+              additionalLimit: Number(cronPolicy.additional_limit),
+              stateDir: paths.stateDir,
+            },
+          },
+        } : {}),
       },
     },
   };
@@ -1571,6 +1951,41 @@ function installManagedNativeService(accountId, config) {
   const unit = `[Unit]\nDescription=OpenClaw Managed WhatsApp Gateway #${accountId}\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=root\nWorkingDirectory=${paths.base}\nEnvironment=HOME=/root\nEnvironment=OPENCLAW_STATE_DIR=${paths.base}\nEnvironment=OPENCLAW_CONFIG_PATH=${paths.configPath}\nEnvironment=CODEX_HOME=/root/.codex\nExecStart=${NODE_BIN} ${OPENCLAW_BIN} gateway --port ${config.gateway.port}\nRestart=always\nRestartSec=5\nRestartPreventExitStatus=78\n\n[Install]\nWantedBy=multi-user.target\n`;
   fs.writeFileSync(paths.serviceFile, unit);
   run('systemctl daemon-reload');
+}
+
+function ensureManagedApiDeviceScopes(accountId) {
+  const paths = managedAccountPaths(accountId);
+  const identity = readJsonFile('/root/.openclaw/identity/device.json', {});
+  const deviceId = identity.deviceId;
+  if (!deviceId) throw new Error('API device identity is missing');
+
+  const devicesDir = path.join(paths.base, 'devices');
+  const pairedPath = path.join(devicesDir, 'paired.json');
+  const pendingPath = path.join(devicesDir, 'pending.json');
+  const paired = readJsonFile(pairedPath, {});
+  const device = paired[deviceId];
+  if (!device?.tokens?.operator) throw new Error('API device is not paired with managed gateway');
+
+  const scopes = ['operator.read', 'operator.admin', 'operator.write', 'operator.pairing'];
+  device.scopes = scopes;
+  device.tokens.operator.scopes = scopes;
+  fs.writeFileSync(pairedPath, JSON.stringify(paired, null, 2) + '\n', { mode: 0o600 });
+
+  const identityDir = path.join(paths.base, 'identity');
+  fs.mkdirSync(identityDir, { recursive: true, mode: 0o700 });
+  fs.copyFileSync('/root/.openclaw/identity/device.json', path.join(identityDir, 'device.json'));
+  fs.chmodSync(path.join(identityDir, 'device.json'), 0o600);
+  fs.writeFileSync(path.join(identityDir, 'device-auth.json'), JSON.stringify({
+    version: 1,
+    deviceId,
+    tokens: { operator: device.tokens.operator },
+  }, null, 2) + '\n', { mode: 0o600 });
+
+  const pending = readJsonFile(pendingPath, {});
+  for (const [requestId, request] of Object.entries(pending)) {
+    if (request?.deviceId === deviceId) delete pending[requestId];
+  }
+  fs.writeFileSync(pendingPath, JSON.stringify(pending, null, 2) + '\n', { mode: 0o600 });
 }
 
 app.get('/managed-router/:accountId/status', async (req, res) => {
@@ -1618,18 +2033,37 @@ app.put('/managed-router/:accountId/routes', (req, res) => {
   if (!Array.isArray(routes)) {
     return res.status(400).json({ ok: false, error: 'routes array is required' });
   }
-  writeManagedRoutes(accountId, routes);
   try {
+    const paths = managedAccountPaths(accountId);
+    const previousRoutes = readManagedRoutes(accountId);
+    const previousConfig = readJsonFile(paths.configPath, null);
     const config = buildManagedNativeConfig(accountId, routes, account);
+    const routesChanged = JSON.stringify(previousRoutes) !== JSON.stringify(routes);
+    const configChanged = JSON.stringify(previousConfig) !== JSON.stringify(config);
+    const { serviceName } = paths;
+    const active = run(`systemctl is-active ${quote(serviceName)} 2>/dev/null; true`) === 'active';
+
+    // Provision is intentionally idempotent. Restarting an unchanged managed
+    // gateway creates a 25-35 second boot window and can make the immediately
+    // following cron sync exceed an upstream 30-second proxy timeout.
+    if (!routesChanged && !configChanged && active) {
+      return res.json({
+        ok: true,
+        success: true,
+        route_count: routes.length,
+        routing_mode: 'native-bindings',
+        gateway_port: config.gateway.port,
+        restarted: false,
+        unchanged: true,
+      });
+    }
+
+    writeManagedRoutes(accountId, routes);
+    const restarted = active;
+    if (restarted) run(`systemctl stop ${quote(serviceName)}`);
     installManagedNativeService(accountId, config);
-    const { serviceName } = managedAccountPaths(accountId);
-    let restarted = false;
-    try {
-      if (run(`systemctl is-active ${quote(serviceName)} 2>/dev/null; true`) === 'active') {
-        run(`systemctl restart ${quote(serviceName)}`);
-        restarted = true;
-      }
-    } catch {}
+    ensureManagedApiDeviceScopes(accountId);
+    run(`systemctl start ${quote(serviceName)}`);
     res.json({ ok: true, success: true, route_count: routes.length, routing_mode: 'native-bindings', gateway_port: config.gateway.port, restarted });
   } catch (error) {
     res.status(500).json({ ok: false, error: 'Failed to compile native managed gateway', detail: error.message });
@@ -1727,7 +2161,23 @@ app.post('/managed-router/:accountId/login/start', (req, res) => {
   child.on('error', (error) => { session.status = 'failed'; session.output += `\n${error.message}`; });
   child.on('exit', (code) => {
     session.exit_code = code;
-    session.status = fs.existsSync(path.join(paths.credsDir, 'creds.json')) ? 'connected' : (code === 0 ? 'finished' : 'failed');
+    const paired = fs.existsSync(path.join(paths.credsDir, 'creds.json'));
+    session.status = paired ? 'activating' : (code === 0 ? 'finished' : 'failed');
+
+    // QR login and the permanent gateway are separate processes. Activate the
+    // gateway here as soon as credentials exist so success does not depend on
+    // a browser polling /login/status at exactly the right time.
+    if (paired) {
+      try {
+        run(`systemctl enable ${quote(paths.serviceName)}`);
+        run(`systemctl restart ${quote(paths.serviceName)}`);
+        session.status = 'connected';
+        session.activated_at = new Date().toISOString();
+      } catch (error) {
+        session.status = 'activation_failed';
+        session.activation_error = error.message;
+      }
+    }
   });
   setTimeout(() => {
     if (session.status === 'running') { child.kill('SIGTERM'); session.status = 'timeout'; }
@@ -1790,6 +2240,8 @@ app.get('/managed-router/:accountId/login/status', async (req, res) => {
     output: renderTerminalOutput(session?.output || ''),
     started_at: session?.started_at || null,
     exit_code: session?.exit_code ?? null,
+    activated_at: session?.activated_at || null,
+    activation_error: session?.activation_error || null,
   });
 });
 
@@ -2182,6 +2634,12 @@ app.post('/model-pool/:accountId/backups/:backupName/restore', (req, res) => {
 app.listen(PORT, HOST, () => {
   console.log(`OpenClaw API Server running on ${HOST}:${PORT}`);
   recoverInterruptedModelPoolJobs();
+  setTimeout(() => {
+    try { monitorDisk(); } catch {}
+  }, 3000);
+  setInterval(() => {
+    try { monitorDisk(); } catch {}
+  }, DISK_MONITOR_INTERVAL_MS);
   setTimeout(() => monitorManagedWhatsApp().catch(() => {}), 5000);
   setInterval(() => monitorManagedWhatsApp().catch(() => {}), 60000);
   setTimeout(() => monitorModelPools().catch(() => {}), 15000);

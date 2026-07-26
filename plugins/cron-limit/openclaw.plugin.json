@@ -1,0 +1,35 @@
+{
+  "id": "heyurassistant-cron-limit",
+  "name": "HeyUrAssistant Cron Limit",
+  "description": "Blocks creation of cron jobs above the client plan limit.",
+  "version": "1.0.0",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["maxTotal", "defaultCount", "additionalLimit", "stateDir"],
+    "properties": {
+      "maxTotal": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 500
+      },
+      "defaultCount": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 500
+      },
+      "additionalLimit": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 500
+      },
+      "stateDir": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

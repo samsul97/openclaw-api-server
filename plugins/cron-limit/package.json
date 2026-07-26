@@ -1,0 +1,13 @@
+{
+  "name": "@heyurassistant/openclaw-cron-limit",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.js"],
+    "compat": {
+      "pluginApi": ">=2026.6.6",
+      "minGatewayVersion": ">=2026.6.6"
+    }
+  }
+}
