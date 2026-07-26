@@ -8,6 +8,7 @@ import {
   countCronJobs,
   cronJobName,
   evaluateCronAdd,
+  evaluateCronCollision,
   evaluateCronRemove,
 } from './policy.js';
 
@@ -88,4 +89,65 @@ test('allows removal of ordinary user cron', () => {
     () => 'aldo__health_custom_reminder',
   );
   assert.equal(result, undefined);
+});
+
+test('blocks a recurring cron within the configured minimum gap', () => {
+  const result = evaluateCronCollision(
+    { stateDir: '/state', minGapMinutes: 15 },
+    { schedule: { kind: 'cron', expr: '35 7 * * *', tz: 'Asia/Jakarta' } },
+    () => [{
+      id: 'existing',
+      name: 'admin_daily_agenda',
+      kind: 'cron',
+      expr: '30 7 * * *',
+      tz: 'Asia/Jakarta',
+    }],
+  );
+  assert.equal(result.block, true);
+  assert.match(result.blockReason, /07:45/);
+  assert.match(result.blockReason, /mengonfirmasi/);
+});
+
+test('allows a recurring cron at exactly the minimum gap', () => {
+  const result = evaluateCronCollision(
+    { stateDir: '/state', minGapMinutes: 15 },
+    { schedule: { kind: 'cron', expr: '45 7 * * *', tz: 'Asia/Jakarta' } },
+    () => [{
+      id: 'existing',
+      name: 'admin_daily_agenda',
+      kind: 'cron',
+      expr: '30 7 * * *',
+      tz: 'Asia/Jakarta',
+    }],
+  );
+  assert.equal(result, undefined);
+});
+
+test('does not collide recurring jobs with different recurrence fields', () => {
+  const result = evaluateCronCollision(
+    { stateDir: '/state', minGapMinutes: 15 },
+    { schedule: { kind: 'cron', expr: '30 7 * * 2', tz: 'Asia/Jakarta' } },
+    () => [{
+      id: 'existing',
+      name: 'monday_job',
+      kind: 'cron',
+      expr: '30 7 * * 1',
+      tz: 'Asia/Jakarta',
+    }],
+  );
+  assert.equal(result, undefined);
+});
+
+test('blocks one-shot reminders inside the minimum gap', () => {
+  const result = evaluateCronCollision(
+    { stateDir: '/state', minGapMinutes: 15 },
+    { schedule: { kind: 'at', at: '2026-08-01T03:10:00.000Z' } },
+    () => [{
+      id: 'existing',
+      name: 'one_shot',
+      kind: 'at',
+      at: '2026-08-01T03:00:00.000Z',
+    }],
+  );
+  assert.equal(result.block, true);
 });

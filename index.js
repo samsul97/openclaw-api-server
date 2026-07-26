@@ -841,12 +841,13 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
         whatsapp: { enabled: true },
         'heyurassistant-cron-limit': {
           enabled: true,
-          config: {
-            maxTotal: maxCronTotal,
-            defaultCount: defaultCronCount,
-            additionalLimit: additionalCronLimit,
-            stateDir: paths.stateDir,
-          },
+            config: {
+              maxTotal: maxCronTotal,
+              defaultCount: defaultCronCount,
+              additionalLimit: additionalCronLimit,
+              stateDir: paths.stateDir,
+              minGapMinutes: 15,
+            },
         },
       },
     },
@@ -1912,6 +1913,7 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
               defaultCount: Number(cronPolicy.default_count),
               additionalLimit: Number(cronPolicy.additional_limit),
               stateDir: paths.stateDir,
+              minGapMinutes: 15,
             },
           },
         } : {}),

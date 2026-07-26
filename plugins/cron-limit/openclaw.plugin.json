@@ -29,6 +29,12 @@
       "stateDir": {
         "type": "string",
         "minLength": 1
+      },
+      "minGapMinutes": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 180,
+        "default": 15
       }
     }
   }

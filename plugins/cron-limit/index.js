@@ -1,5 +1,9 @@
 import { definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
-import { evaluateCronAdd, evaluateCronRemove } from './policy.js';
+import {
+  evaluateCronAdd,
+  evaluateCronCollision,
+  evaluateCronRemove,
+} from './policy.js';
 
 export default definePluginEntry({
   id: 'heyurassistant-cron-limit',
@@ -15,7 +19,11 @@ export default definePluginEntry({
         if (event.toolName !== 'cron') return;
 
         const action = String(event.params?.action || '').toLowerCase();
-        if (action === 'add') return evaluateCronAdd(config);
+        if (action === 'add') {
+          const quotaResult = evaluateCronAdd(config);
+          if (quotaResult) return quotaResult;
+          return evaluateCronCollision(config, event.params?.job);
+        }
         if (action === 'remove') {
           return evaluateCronRemove(config, String(event.params?.jobId || event.params?.id || ''));
         }
