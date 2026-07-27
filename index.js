@@ -933,17 +933,21 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
   const defaultCronCount = Number(cronPolicy.default_count);
   const additionalCronLimit = Number(cronPolicy.additional_limit);
   const maxConcurrentCronRuns = Number(cronPolicy.max_concurrent_runs);
+  const minCronGapMinutes = Number(cronPolicy.min_gap_minutes);
   if (!Number.isInteger(maxCronTotal) || maxCronTotal < 0 || maxCronTotal > 500
       || !Number.isInteger(defaultCronCount) || defaultCronCount < 0
       || !Number.isInteger(additionalCronLimit) || additionalCronLimit < 0
       || !Number.isInteger(maxConcurrentCronRuns) || maxConcurrentCronRuns < 1 || maxConcurrentCronRuns > 32
+      || !Number.isInteger(minCronGapMinutes) || minCronGapMinutes < 0 || minCronGapMinutes > 60
       || maxCronTotal !== defaultCronCount + additionalCronLimit) {
     throw new Error('cron_policy must contain valid quota and concurrency settings');
   }
   const cronLimitPluginPath = ensureCronLimitPlugin(paths);
+  const modelProvider = normalizeDashboardModelProvider(payload.model_provider, model);
 
   const next = {
     ...existingConfig,
+    models: mergeDashboardModelProvider(existing.models, modelProvider),
     agents: {
       ...(existing.agents || {}),
       defaults: {
@@ -1015,7 +1019,7 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
               defaultCount: defaultCronCount,
               additionalLimit: additionalCronLimit,
               stateDir: paths.stateDir,
-              minGapMinutes: 5,
+              minGapMinutes: minCronGapMinutes,
             },
         },
       },
@@ -1029,6 +1033,61 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
   }
 
   return next;
+}
+
+function normalizeDashboardModelProvider(provider, primaryModel) {
+  if (!provider) {
+    if (primaryModel === 'nvidia/z-ai/glm-5.2') {
+      throw new Error('NVIDIA model_provider configuration is required');
+    }
+    return null;
+  }
+  if (provider.id !== 'nvidia' || primaryModel !== 'nvidia/z-ai/glm-5.2') {
+    throw new Error('Unsupported model_provider configuration');
+  }
+  if (provider.configured !== true || typeof provider.api_key !== 'string' || provider.api_key.trim() === '') {
+    throw new Error('NVIDIA_API_KEY is not configured');
+  }
+  if (provider.base_url !== 'https://integrate.api.nvidia.com/v1'
+      || provider.api !== 'openai-completions') {
+    throw new Error('Invalid NVIDIA provider endpoint or API mode');
+  }
+  const models = Array.isArray(provider.models) ? provider.models : [];
+  if (models.length !== 1 || models[0]?.id !== 'z-ai/glm-5.2') {
+    throw new Error('Invalid NVIDIA model catalog');
+  }
+
+  return {
+    id: 'nvidia',
+    config: {
+      baseUrl: provider.base_url,
+      apiKey: provider.api_key,
+      api: 'openai-completions',
+      timeoutSeconds: 300,
+      models: models.map(item => ({
+        id: item.id,
+        name: item.name || 'NVIDIA NIM · GLM 5.2',
+        reasoning: item.reasoning !== false,
+        input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: Number(item.context_window) || 1000000,
+        maxTokens: Number(item.max_tokens) || 16384,
+        compat: { requiresStringContent: true },
+      })),
+    },
+  };
+}
+
+function mergeDashboardModelProvider(existingModels = {}, provider = null) {
+  if (!provider) return existingModels;
+  return {
+    ...existingModels,
+    mode: 'merge',
+    providers: {
+      ...(existingModels?.providers || {}),
+      [provider.id]: provider.config,
+    },
+  };
 }
 
 function inferGlobalGroupAllowFrom(groups, allowFrom, existing) {
@@ -1094,14 +1153,21 @@ app.post('/clients/validate-provision', (req, res) => {
     if (!isAllowedWorkspaceFile(file)) errors.push(`Unsupported workspace file: ${file}`);
   }
   if (!config || typeof config !== 'object' || Array.isArray(config)) errors.push('config must be an object');
+  try {
+    normalizeDashboardModelProvider(config?.model_provider, config?.primary_model);
+  } catch (error) {
+    errors.push(error.message);
+  }
   const maxCronTotal = Number(config?.cron_policy?.max_total);
   const defaultCronCount = Number(config?.cron_policy?.default_count);
   const additionalCronLimit = Number(config?.cron_policy?.additional_limit);
   const maxConcurrentCronRuns = Number(config?.cron_policy?.max_concurrent_runs);
+  const minCronGapMinutes = Number(config?.cron_policy?.min_gap_minutes);
   if (!Number.isInteger(maxCronTotal) || maxCronTotal < 0 || maxCronTotal > 500
       || !Number.isInteger(defaultCronCount) || defaultCronCount < 0
       || !Number.isInteger(additionalCronLimit) || additionalCronLimit < 0
       || !Number.isInteger(maxConcurrentCronRuns) || maxConcurrentCronRuns < 1 || maxConcurrentCronRuns > 32
+      || !Number.isInteger(minCronGapMinutes) || minCronGapMinutes < 0 || minCronGapMinutes > 60
       || maxCronTotal !== defaultCronCount + additionalCronLimit) {
     errors.push('Invalid or missing config.cron_policy');
   }
@@ -2017,12 +2083,17 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
   const port = resolveManagedGatewayPort(accountId, account.gateway_port, existing.gateway?.port);
   const token = existing.gateway?.auth?.token || crypto.randomBytes(24).toString('hex');
   const incomingCronPolicy = dmClients.find(client => client.cron_policy)?.cron_policy;
+  const nvidiaClient = dmClients.find(client => client.primary_model === 'nvidia/z-ai/glm-5.2');
+  const managedModelProvider = nvidiaClient
+    ? normalizeDashboardModelProvider(nvidiaClient.model_provider, nvidiaClient.primary_model)
+    : null;
   const existingCronPolicy = existing.plugins?.entries?.['heyurassistant-cron-limit']?.config;
   const cronPolicy = incomingCronPolicy || (existingCronPolicy ? {
     max_total: existingCronPolicy.maxTotal,
     default_count: existingCronPolicy.defaultCount,
     additional_limit: existingCronPolicy.additionalLimit,
     max_concurrent_runs: existing.cron?.maxConcurrentRuns,
+    min_gap_minutes: existingCronPolicy.minGapMinutes,
   } : null);
   let cronLimitPluginPath = null;
   if (cronPolicy) {
@@ -2030,9 +2101,11 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
     const defaultCount = Number(cronPolicy.default_count);
     const additionalLimit = Number(cronPolicy.additional_limit);
     const maxConcurrentRuns = Number(cronPolicy.max_concurrent_runs);
+    const minGapMinutes = Number(cronPolicy.min_gap_minutes);
     if (!Number.isInteger(maxTotal) || !Number.isInteger(defaultCount)
         || !Number.isInteger(additionalLimit)
         || !Number.isInteger(maxConcurrentRuns) || maxConcurrentRuns < 1 || maxConcurrentRuns > 32
+        || !Number.isInteger(minGapMinutes) || minGapMinutes < 0 || minGapMinutes > 60
         || maxTotal !== defaultCount + additionalLimit) {
       throw new Error('Managed client cron_policy is invalid');
     }
@@ -2041,6 +2114,7 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
 
   return {
     ...existingConfig,
+    models: mergeDashboardModelProvider(existing.models, managedModelProvider),
     agents: {
       defaults: {
         ...(existing.agents?.defaults || {}),
@@ -2093,7 +2167,7 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
               defaultCount: Number(cronPolicy.default_count),
               additionalLimit: Number(cronPolicy.additional_limit),
               stateDir: paths.stateDir,
-              minGapMinutes: 5,
+              minGapMinutes: Number(cronPolicy.min_gap_minutes),
             },
           },
         } : {}),
