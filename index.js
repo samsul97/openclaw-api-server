@@ -613,7 +613,11 @@ function getManagedChannelRuntime(accountId) {
       let gatewayLogs = '';
       if (channel.connected !== true) {
         try {
-          gatewayLogs = run(`journalctl -u ${quote(paths.serviceName)} --since '-15 minutes' --no-pager -n 160 2>/dev/null; true`, { timeout: 5000 });
+          // Read enough of the current gateway lifecycle to support stable
+          // channels that have not emitted a fresh "Listening" line recently.
+          // Ordering matters: a later disconnect still wins over an older
+          // Listening event.
+          gatewayLogs = run(`journalctl -u ${quote(paths.serviceName)} --since '-24 hours' --no-pager -n 500 2>/dev/null; true`, { timeout: 5000 });
           if (!lastError) {
             lastError = gatewayLogs.split('\n')
               .filter(line => /401|unauthorized|logged out|connection failure|ETIMEDOUT|ECONN/i.test(line))
