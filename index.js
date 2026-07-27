@@ -927,7 +927,7 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
   }
 
   const model = payload.primary_model || existing.agents?.defaults?.model?.primary || 'openai/gpt-5.5';
-  const fallbacks = Array.isArray(payload.fallback_models) ? payload.fallback_models : [];
+  const fallbacks = [];
   const cronPolicy = payload.cron_policy || {};
   const maxCronTotal = Number(cronPolicy.max_total);
   const defaultCronCount = Number(cronPolicy.default_count);
@@ -947,7 +947,7 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
 
   const next = {
     ...existingConfig,
-    models: mergeDashboardModelProvider(existing.models, modelProvider),
+    models: singleModelProviderConfig(modelProvider),
     agents: {
       ...(existing.agents || {}),
       defaults: {
@@ -1078,16 +1078,49 @@ function normalizeDashboardModelProvider(provider, primaryModel) {
   };
 }
 
-function mergeDashboardModelProvider(existingModels = {}, provider = null) {
-  if (!provider) return existingModels;
+function singleModelProviderConfig(provider = null) {
+  if (!provider) return undefined;
   return {
-    ...existingModels,
-    mode: 'merge',
+    mode: 'replace',
     providers: {
-      ...(existingModels?.providers || {}),
       [provider.id]: provider.config,
     },
   };
+}
+
+function clearClientSessionModelOverrides(name) {
+  const paths = clientPaths(name);
+  const sessionsPath = path.join(paths.stateDir, 'agents', 'main', 'sessions', 'sessions.json');
+  if (!fs.existsSync(sessionsPath)) return { changed: 0 };
+
+  const sessions = readJsonFile(sessionsPath, {});
+  const fields = [
+    'providerOverride',
+    'modelOverride',
+    'modelOverrideSource',
+    'modelOverrideFallbackOriginProvider',
+    'modelOverrideFallbackOriginModel',
+  ];
+  let changed = 0;
+  for (const entry of Object.values(sessions)) {
+    if (!entry || typeof entry !== 'object') continue;
+    let entryChanged = false;
+    for (const field of fields) {
+      if (Object.prototype.hasOwnProperty.call(entry, field)) {
+        delete entry[field];
+        entryChanged = true;
+      }
+    }
+    if (entryChanged) changed += 1;
+  }
+  if (changed > 0) {
+    const backupPath = `${sessionsPath}.before-model-switch-${Date.now()}`;
+    fs.copyFileSync(sessionsPath, backupPath);
+    fs.writeFileSync(sessionsPath, JSON.stringify(sessions, null, 2) + '\n');
+    chownIfHome(paths, backupPath);
+    chownIfHome(paths, sessionsPath);
+  }
+  return { changed };
 }
 
 function inferGlobalGroupAllowFrom(groups, allowFrom, existing) {
@@ -1288,8 +1321,18 @@ app.patch('/clients/:name', (req, res) => {
   if (fullDashboardPayload) {
     const next = buildConfigFromDashboard(name, req.body, existing);
     writeClientConfig(name, next);
+    const sessionReset = req.body.single_model_mode === true
+      ? clearClientSessionModelOverrides(name)
+      : { changed: 0 };
     if (req.body.blueprint !== undefined) writeBlueprint(name, req.body.blueprint);
-    return res.json({ ok: true, success: true, restarted: false, message: `Client '${name}' full config updated`, port: next.gateway?.port });
+    return res.json({
+      ok: true,
+      success: true,
+      restarted: false,
+      message: `Client '${name}' full config updated`,
+      port: next.gateway?.port,
+      session_model_overrides_cleared: sessionReset.changed,
+    });
   }
 
   let changed = false;
@@ -2114,13 +2157,16 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
 
   return {
     ...existingConfig,
-    models: mergeDashboardModelProvider(existing.models, managedModelProvider),
+    models: singleModelProviderConfig(managedModelProvider),
     agents: {
       defaults: {
         ...(existing.agents?.defaults || {}),
-        model: existing.agents?.defaults?.model || {
-          primary: 'openai/gpt-5.5',
+        model: {
+          primary: agents[0]?.model || 'openai/gpt-5.5',
           fallbacks: [],
+        },
+        models: {
+          [agents[0]?.model || 'openai/gpt-5.5']: {},
         },
       },
       list: agents,
@@ -2294,6 +2340,16 @@ app.put('/managed-router/:accountId/routes', (req, res) => {
     const previousRoutes = readManagedRoutes(accountId);
     const previousConfig = readJsonFile(paths.configPath, null);
     const config = buildManagedNativeConfig(accountId, routes, account);
+    const sessionOverridesCleared = account.single_model_mode === true
+      ? (account.dm_clients || []).reduce(
+          (total, client) => total + (
+            client?.client_name
+              ? clearClientSessionModelOverrides(client.client_name).changed
+              : 0
+          ),
+          0,
+        )
+      : 0;
     const routesChanged = JSON.stringify(previousRoutes) !== JSON.stringify(routes);
     const configChanged = JSON.stringify(previousConfig) !== JSON.stringify(config);
     const { serviceName } = paths;
@@ -2311,6 +2367,7 @@ app.put('/managed-router/:accountId/routes', (req, res) => {
         gateway_port: config.gateway.port,
         restarted: false,
         unchanged: true,
+        session_model_overrides_cleared: sessionOverridesCleared,
       });
     }
 
@@ -2320,7 +2377,15 @@ app.put('/managed-router/:accountId/routes', (req, res) => {
     installManagedNativeService(accountId, config);
     ensureManagedApiDeviceScopes(accountId);
     run(`systemctl start ${quote(serviceName)}`);
-    res.json({ ok: true, success: true, route_count: routes.length, routing_mode: 'native-bindings', gateway_port: config.gateway.port, restarted });
+    res.json({
+      ok: true,
+      success: true,
+      route_count: routes.length,
+      routing_mode: 'native-bindings',
+      gateway_port: config.gateway.port,
+      restarted,
+      session_model_overrides_cleared: sessionOverridesCleared,
+    });
   } catch (error) {
     res.status(500).json({ ok: false, error: 'Failed to compile native managed gateway', detail: error.message });
   }
