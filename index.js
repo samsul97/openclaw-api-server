@@ -603,30 +603,46 @@ function getManagedChannelRuntime(accountId) {
 
   return new Promise(resolve => {
     execFile(NODE_BIN, [OPENCLAW_BIN, 'channels', 'status', '--json', '--url', `ws://127.0.0.1:${port}`, '--token', token], {
-      encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
+      encoding: 'utf8', timeout: 8000, maxBuffer: 1024 * 1024,
       env: { ...process.env, HOME: '/root', OPENCLAW_STATE_DIR: paths.base, OPENCLAW_CONFIG_PATH: paths.configPath, CODEX_HOME: '/root/.codex' },
     }, (error, stdout) => {
       let parsed = {};
       try { parsed = JSON.parse(String(stdout || '').trim()); } catch {}
       const channel = parsed.channels?.whatsapp || parsed.channelAccounts?.whatsapp?.[0] || {};
       let lastError = channel.lastError || parsed.error || error?.message || null;
-      if (channel.connected !== true && !lastError) {
+      let gatewayLogs = '';
+      if (channel.connected !== true) {
         try {
-          const logs = run(`journalctl -u ${quote(paths.serviceName)} --since '-15 minutes' --no-pager -n 120 2>/dev/null; true`, { timeout: 10000 });
-          lastError = logs.split('\n').filter(line => /401|unauthorized|logged out|connection failure|ETIMEDOUT|ECONN/i.test(line)).at(-1) || null;
+          gatewayLogs = run(`journalctl -u ${quote(paths.serviceName)} --since '-15 minutes' --no-pager -n 160 2>/dev/null; true`, { timeout: 5000 });
+          if (!lastError) {
+            lastError = gatewayLogs.split('\n')
+              .filter(line => /401|unauthorized|logged out|connection failure|ETIMEDOUT|ECONN/i.test(line))
+              .at(-1) || null;
+          }
         } catch {}
       }
+      const lastListening = gatewayLogs.lastIndexOf('Listening for WhatsApp inbound messages');
+      const lastDisconnect = Math.max(
+        gatewayLogs.lastIndexOf('Web connection closed'),
+        gatewayLogs.lastIndexOf('channel exited'),
+        gatewayLogs.lastIndexOf('logged out'),
+      );
+      const logFallbackConnected = Boolean(error)
+        && lastListening >= 0
+        && lastListening > lastDisconnect;
+      const connected = channel.connected === true || logFallbackConnected;
       resolve({
         checked: true,
-        connected: channel.connected === true,
-        running: channel.running === true,
-        linked: channel.linked === true || channel.statusState === 'linked',
-        health_state: channel.healthState || (channel.connected ? 'healthy' : 'disconnected'),
+        connected,
+        running: channel.running === true || logFallbackConnected,
+        linked: channel.linked === true || channel.statusState === 'linked' || logFallbackConnected,
+        health_state: channel.healthState || (connected ? 'healthy' : 'disconnected'),
+        status_source: logFallbackConnected ? 'gateway_log_fallback' : 'channels_status',
         last_connected_at: channel.lastConnectedAt || null,
         last_inbound_at: channel.lastInboundAt || null,
         last_message_at: channel.lastMessageAt || null,
-        error_category: classifyWhatsAppError(lastError),
-        last_error: lastError ? String(lastError).slice(0, 500) : null,
+        error_category: connected ? null : classifyWhatsAppError(lastError),
+        last_error: connected ? null : (lastError ? String(lastError).slice(0, 500) : null),
       });
     });
   });
