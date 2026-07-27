@@ -944,6 +944,7 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
   }
   const cronLimitPluginPath = ensureCronLimitPlugin(paths);
   const modelProvider = normalizeDashboardModelProvider(payload.model_provider, model);
+  const webSearch = normalizeWebSearchPolicy(payload.web_search);
 
   const next = {
     ...existingConfig,
@@ -999,10 +1000,24 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
       ...(existing.cron || {}),
       maxConcurrentRuns: maxConcurrentCronRuns,
     },
-    tools: existing.tools || { profile: 'coding' },
+    tools: {
+      ...(existing.tools || { profile: 'coding' }),
+      web: {
+        search: {
+          enabled: true,
+          provider: webSearch.provider,
+          maxResults: 10,
+          timeoutSeconds: 30,
+          cacheTtlMinutes: 15,
+        },
+        fetch: {
+          enabled: webSearch.fetchEnabled,
+        },
+      },
+    },
     plugins: {
       ...(existing.plugins || {}),
-      allow: [...new Set([...(existing.plugins?.allow || []), 'openai', 'whatsapp', 'heyurassistant-cron-limit'])],
+      allow: [...new Set([...(existing.plugins?.allow || []), 'openai', 'whatsapp', 'parallel', 'heyurassistant-cron-limit'])],
       bundledDiscovery: 'compat',
       load: {
         ...(existing.plugins?.load || {}),
@@ -1012,6 +1027,7 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
         ...(existing.plugins?.entries || {}),
         openai: { enabled: true },
         whatsapp: { enabled: true },
+        parallel: { enabled: true },
         'heyurassistant-cron-limit': {
           enabled: true,
             config: {
@@ -1033,6 +1049,16 @@ function buildConfigFromDashboard(name, payload, existing = {}) {
   }
 
   return next;
+}
+
+function normalizeWebSearchPolicy(policy) {
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
+    throw new Error('web_search policy is required');
+  }
+  if (policy.enabled !== true || policy.provider !== 'parallel-free' || policy.fetch_enabled !== true) {
+    throw new Error('web_search must use the managed parallel-free provider with fetch enabled');
+  }
+  return { provider: 'parallel-free', fetchEnabled: true };
 }
 
 function normalizeDashboardModelProvider(provider, primaryModel) {
@@ -1191,6 +1217,11 @@ app.post('/clients/validate-provision', (req, res) => {
   } catch (error) {
     errors.push(error.message);
   }
+  try {
+    normalizeWebSearchPolicy(config?.web_search);
+  } catch (error) {
+    errors.push(error.message);
+  }
   const maxCronTotal = Number(config?.cron_policy?.max_total);
   const defaultCronCount = Number(config?.cron_policy?.default_count);
   const additionalCronLimit = Number(config?.cron_policy?.additional_limit);
@@ -1314,6 +1345,7 @@ app.patch('/clients/:name', (req, res) => {
     req.body.groups ||
     req.body.assistants ||
     req.body.integrations ||
+    req.body.web_search ||
     req.body.workspace_dir ||
     req.body.codex_home
   );
@@ -2126,6 +2158,8 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
   const port = resolveManagedGatewayPort(accountId, account.gateway_port, existing.gateway?.port);
   const token = existing.gateway?.auth?.token || crypto.randomBytes(24).toString('hex');
   const incomingCronPolicy = dmClients.find(client => client.cron_policy)?.cron_policy;
+  const incomingWebSearch = dmClients.find(client => client.web_search)?.web_search;
+  const webSearch = normalizeWebSearchPolicy(incomingWebSearch);
   const nvidiaClient = dmClients.find(client => client.primary_model === 'nvidia/z-ai/glm-5.2');
   const managedModelProvider = nvidiaClient
     ? normalizeDashboardModelProvider(nvidiaClient.model_provider, nvidiaClient.primary_model)
@@ -2197,14 +2231,29 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
         maxConcurrentRuns: Number(cronPolicy.max_concurrent_runs),
       },
     } : {}),
-    tools: existing.tools || { profile: 'coding' },
+    tools: {
+      ...(existing.tools || { profile: 'coding' }),
+      web: {
+        search: {
+          enabled: true,
+          provider: webSearch.provider,
+          maxResults: 10,
+          timeoutSeconds: 30,
+          cacheTtlMinutes: 15,
+        },
+        fetch: {
+          enabled: webSearch.fetchEnabled,
+        },
+      },
+    },
     plugins: {
-      allow: ['openai', 'whatsapp', ...(cronLimitPluginPath ? ['heyurassistant-cron-limit'] : [])],
+      allow: ['openai', 'whatsapp', 'parallel', ...(cronLimitPluginPath ? ['heyurassistant-cron-limit'] : [])],
       bundledDiscovery: 'compat',
       ...(cronLimitPluginPath ? { load: { paths: [cronLimitPluginPath] } } : {}),
       entries: {
         openai: { enabled: true },
         whatsapp: { enabled: true },
+        parallel: { enabled: true },
         ...(cronLimitPluginPath ? {
           'heyurassistant-cron-limit': {
             enabled: true,
@@ -2975,4 +3024,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { cronHealthIssue };
+module.exports = { cronHealthIssue, normalizeWebSearchPolicy };
