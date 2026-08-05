@@ -116,6 +116,7 @@ function sleepSync(ms) {
 
 function execOpenClawAfterGatewayReady(args, options = {}) {
   let lastError;
+  let managedScopeRepairAttempted = false;
   // A full OpenClaw config reload can take 25-30 seconds on the shared VPS.
   // Keep retrying transient websocket startup failures within the caller's
   // 60-second HTTP budget instead of failing cron sync after only 16 seconds.
@@ -126,6 +127,14 @@ function execOpenClawAfterGatewayReady(args, options = {}) {
     } catch (error) {
       lastError = error;
       const detail = String(error.stderr || error.message || '');
+      const managedStateMatch = String(options.env?.OPENCLAW_STATE_DIR || '')
+        .match(/^\/root\/\.openclaw\/managed-accounts\/([1-9][0-9]*)$/);
+      if (!managedScopeRepairAttempted && managedStateMatch
+          && /scope upgrade pending approval/i.test(detail)) {
+        managedScopeRepairAttempted = true;
+        const repair = prepareManagedCronAccess(managedAccountPaths(Number(managedStateMatch[1])));
+        if (repair.changed) continue;
+      }
       const transient = /1006|ECONNREFUSED|not yet ready|closed before connect/i.test(detail);
       if (!transient || attempt === maxAttempts) throw error;
       sleepSync(2000);
