@@ -132,8 +132,23 @@ function execOpenClawAfterGatewayReady(args, options = {}) {
       if (!managedScopeRepairAttempted && managedStateMatch
           && /scope upgrade pending approval/i.test(detail)) {
         managedScopeRepairAttempted = true;
-        const repair = prepareManagedCronAccess(managedAccountPaths(Number(managedStateMatch[1])));
-        if (repair.changed) continue;
+        const managedPaths = managedAccountPaths(Number(managedStateMatch[1]));
+        let repair = { changed: false, reason: 'not-attempted' };
+        // The gateway persists its auto-approved read token and pending admin
+        // request immediately before closing the websocket. The CLI can throw
+        // slightly before those atomic renames become visible to this process.
+        for (let repairAttempt = 0; repairAttempt < 12; repairAttempt += 1) {
+          repair = ensureManagedCliOperatorScopes(managedPaths);
+          if (repair.changed) break;
+          if (!['local-identity-not-ready', 'local-identity-mismatch'].includes(repair.reason)) break;
+          sleepSync(250);
+        }
+        if (repair.changed) {
+          run(`systemctl restart ${quote(managedPaths.serviceName)}`);
+          sleepSync(2000);
+          continue;
+        }
+        console.error(`Managed cron scope recovery skipped for account ${managedStateMatch[1]}: ${repair.reason}`);
       }
       const transient = /1006|ECONNREFUSED|not yet ready|closed before connect/i.test(detail);
       if (!transient || attempt === maxAttempts) throw error;
