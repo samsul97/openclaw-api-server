@@ -62,7 +62,7 @@ async function main() {
       },
       printQRInTerminal: false,
       logger: NOOP_LOGGER,
-      browser: ['openclaw', 'cli', '2026.6.6'],
+      browser: ['openclaw', 'cli', '2026.7.1'],
       connectTimeoutMs: 30000,
       defaultQueryTimeoutMs: 20000,
       generateHighQualityLinkPreview: false,
