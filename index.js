@@ -239,6 +239,9 @@ function cronRuntimeSources() {
   if (fs.existsSync(managedRoot)) {
     for (const entry of fs.readdirSync(managedRoot, { withFileTypes: true })) {
       if (!entry.isDirectory() || !/^[0-9]+$/.test(entry.name)) continue;
+      const serviceName = `openclaw-managed-${entry.name}-gateway.service`;
+      const serviceActive = run(`systemctl is-active ${quote(serviceName)} 2>/dev/null; true`).trim() === 'active';
+      if (!serviceActive) continue;
       sources.push({
         key: `managed:${entry.name}`,
         label: `managed-${entry.name}`,
@@ -250,6 +253,32 @@ function cronRuntimeSources() {
   return sources.filter((source, index, all) =>
     all.findIndex((candidate) => candidate.stateDir === source.stateDir) === index
   );
+}
+
+function removeManagedClientCronJobs(accountId, clientName) {
+  if (!validName(clientName)) throw new Error('Invalid client name');
+  const databasePath = path.join(managedAccountPaths(accountId).stateDir, 'state', 'openclaw.sqlite');
+  if (!fs.existsSync(databasePath)) return 0;
+
+  const database = new DatabaseSync(databasePath, { open: true });
+  try {
+    database.exec('BEGIN IMMEDIATE');
+    const jobs = database.prepare('SELECT store_key, job_id FROM cron_jobs WHERE name LIKE ? ESCAPE \'\\\'')
+      .all(`${clientName.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_')}\\_\\_%`);
+    const deleteLogs = database.prepare('DELETE FROM cron_run_logs WHERE job_id = ?');
+    const deleteJob = database.prepare('DELETE FROM cron_jobs WHERE store_key = ? AND job_id = ?');
+    for (const job of jobs) {
+      deleteLogs.run(job.job_id);
+      deleteJob.run(job.store_key, job.job_id);
+    }
+    database.exec('COMMIT');
+    return jobs.length;
+  } catch (error) {
+    try { database.exec('ROLLBACK'); } catch {}
+    throw error;
+  } finally {
+    database.close();
+  }
 }
 
 function readCronHealthRows(source) {
@@ -672,32 +701,42 @@ function getManagedModelRuntime(serviceName) {
   };
 }
 
+let managedWhatsAppMonitorInFlight = false;
+
 async function monitorManagedWhatsApp() {
+  if (managedWhatsAppMonitorInFlight) return;
+  managedWhatsAppMonitorInFlight = true;
   const managedRoot = '/root/.openclaw/managed-accounts';
-  if (!fs.existsSync(managedRoot)) return;
-  for (const entry of fs.readdirSync(managedRoot)) {
-    const accountId = Number(entry);
-    if (!Number.isInteger(accountId)) continue;
-    const paths = managedAccountPaths(accountId);
-    const identity = whatsappSessionIdentity(paths.credsDir);
-    if (!identity.credentials_exist) continue;
-    const runtime = await getManagedChannelRuntime(accountId);
-    const model = getManagedModelRuntime(paths.serviceName);
-    const previous = managedRuntimeChecks.get(accountId);
-    managedRuntimeChecks.set(accountId, { connected: runtime.connected, model_error: model.error_category });
-    persistManagedRuntimeChecks();
-    if (previous === undefined && !runtime.connected) {
-      sendTelegram(`🚨 <b>Managed WhatsApp #${accountId} terputus</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nStatus: <code>${runtime.health_state}</code>\nPenyebab: <code>${runtime.error_category || 'unknown'}</code>\nBuka Managed WA Account, lepas session, lalu pair ulang bila status menunjukkan auth_logged_out.`);
-    } else if (previous?.connected === true && !runtime.connected) {
-      sendTelegram(`🚨 <b>Managed WhatsApp #${accountId} baru saja terputus</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nPenyebab: <code>${runtime.error_category || 'unknown'}</code>`);
-    } else if (previous?.connected === false && runtime.connected) {
-      sendTelegram(`✅ <b>Managed WhatsApp #${accountId} pulih</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nChannel kembali connected.`);
+  try {
+    if (!fs.existsSync(managedRoot)) return;
+    for (const entry of fs.readdirSync(managedRoot)) {
+      const accountId = Number(entry);
+      if (!Number.isInteger(accountId)) continue;
+      const paths = managedAccountPaths(accountId);
+      const identity = whatsappSessionIdentity(paths.credsDir);
+      if (!identity.credentials_exist) continue;
+      const serviceActive = run(`systemctl is-active ${quote(paths.serviceName)} 2>/dev/null; true`).trim() === 'active';
+      if (!serviceActive) continue;
+      const runtime = await getManagedChannelRuntime(accountId);
+      const model = getManagedModelRuntime(paths.serviceName);
+      const previous = managedRuntimeChecks.get(accountId);
+      managedRuntimeChecks.set(accountId, { connected: runtime.connected, model_error: model.error_category });
+      persistManagedRuntimeChecks();
+      if (previous === undefined && !runtime.connected) {
+        sendTelegram(`🚨 <b>Managed WhatsApp #${accountId} terputus</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nStatus: <code>${runtime.health_state}</code>\nPenyebab: <code>${runtime.error_category || 'unknown'}</code>\nBuka Managed WA Account, lepas session, lalu pair ulang bila status menunjukkan auth_logged_out.`);
+      } else if (previous?.connected === true && !runtime.connected) {
+        sendTelegram(`🚨 <b>Managed WhatsApp #${accountId} baru saja terputus</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nPenyebab: <code>${runtime.error_category || 'unknown'}</code>`);
+      } else if (previous?.connected === false && runtime.connected) {
+        sendTelegram(`✅ <b>Managed WhatsApp #${accountId} pulih</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nChannel kembali connected.`);
+      }
+      if (model.error_category && previous?.model_error !== model.error_category) {
+        sendTelegram(`⚠️ <b>Model/provider error pada managed bot #${accountId}</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nPenyebab: <code>${model.error_category}</code>\nWhatsApp: <code>${runtime.connected ? 'connected' : 'disconnected'}</code>`);
+      } else if (!model.error_category && previous?.model_error) {
+        sendTelegram(`✅ <b>Model/provider managed bot #${accountId} pulih</b>\nTidak ada error baru dalam 15 menit terakhir.`);
+      }
     }
-    if (model.error_category && previous?.model_error !== model.error_category) {
-      sendTelegram(`⚠️ <b>Model/provider error pada managed bot #${accountId}</b>\nNomor: <code>${identity.session_phone || '-'}</code>\nPenyebab: <code>${model.error_category}</code>\nWhatsApp: <code>${runtime.connected ? 'connected' : 'disconnected'}</code>`);
-    } else if (!model.error_category && previous?.model_error) {
-      sendTelegram(`✅ <b>Model/provider managed bot #${accountId} pulih</b>\nTidak ada error baru dalam 15 menit terakhir.`);
-    }
+  } finally {
+    managedWhatsAppMonitorInFlight = false;
   }
 }
 
@@ -2178,7 +2217,14 @@ function buildManagedNativeConfig(accountId, routes, account = {}) {
   const port = resolveManagedGatewayPort(accountId, account.gateway_port, existing.gateway?.port);
   const token = existing.gateway?.auth?.token || crypto.randomBytes(24).toString('hex');
   const incomingCronPolicy = dmClients.find(client => client.cron_policy)?.cron_policy;
-  const incomingWebSearch = dmClients.find(client => client.web_search)?.web_search;
+  // Empty inventory slots have no client payload yet, but they still need a
+  // schema-valid bootstrap config so QR pairing can start. Use the same
+  // managed web-search policy that client provisioning supplies later.
+  const incomingWebSearch = dmClients.find(client => client.web_search)?.web_search || {
+    enabled: true,
+    provider: 'parallel-free',
+    fetch_enabled: true,
+  };
   const webSearch = normalizeWebSearchPolicy(incomingWebSearch);
   const nvidiaClient = dmClients.find(client => client.primary_model === 'nvidia/z-ai/glm-5.2');
   const managedModelProvider = nvidiaClient
@@ -2335,7 +2381,10 @@ function ensureManagedApiDeviceScopes(accountId) {
   const pendingPath = path.join(devicesDir, 'pending.json');
   const paired = readJsonFile(pairedPath, {});
   const device = paired[deviceId];
-  if (!device?.tokens?.operator) throw new Error('API device is not paired with managed gateway');
+  // A brand-new empty slot has not started its gateway yet, so there cannot
+  // be a paired API device at initialization time. Pairing is optional for
+  // the QR bootstrap path and can be hardened after the gateway has started.
+  if (!device?.tokens?.operator) return false;
 
   const scopes = ['operator.read', 'operator.admin', 'operator.write', 'operator.pairing'];
   device.scopes = scopes;
@@ -2357,6 +2406,7 @@ function ensureManagedApiDeviceScopes(accountId) {
     if (request?.deviceId === deviceId) delete pending[requestId];
   }
   fs.writeFileSync(pendingPath, JSON.stringify(pending, null, 2) + '\n', { mode: 0o600 });
+  return true;
 }
 
 app.get('/managed-router/:accountId/status', async (req, res) => {
@@ -2738,6 +2788,10 @@ app.delete('/managed-router/:accountId/clients/:clientId/registry', (req, res) =
   if (!Number.isInteger(accountId) || accountId < 1 || !Number.isInteger(clientId) || clientId < 1) {
     return res.status(400).json({ ok: false, error: 'Invalid accountId or clientId' });
   }
+  const clientName = String(req.query.client_name || '');
+  if (!validName(clientName)) {
+    return res.status(400).json({ ok: false, error: 'Valid client_name is required' });
+  }
 
   const registryFile = path.join(managedAccountPaths(accountId).base, 'provisioned-groups.json');
   const registry = readJsonFile(registryFile, {});
@@ -2749,7 +2803,8 @@ app.delete('/managed-router/:accountId/clients/:clientId/registry', (req, res) =
     removed += 1;
   }
   fs.writeFileSync(registryFile, JSON.stringify(registry, null, 2) + '\n');
-  res.json({ ok: true, removed });
+  const cronJobsRemoved = removeManagedClientCronJobs(accountId, clientName);
+  res.json({ ok: true, removed, cron_jobs_removed: cronJobsRemoved });
 });
 
 app.post('/managed-router/:accountId/create-groups', (req, res) => {
@@ -3038,7 +3093,7 @@ if (require.main === module) {
       try { monitorCronHealth(); } catch (error) { console.error(`Cron health monitor failed: ${error.message}`); }
     }, CRON_HEALTH_MONITOR_INTERVAL_MS);
     setTimeout(() => monitorManagedWhatsApp().catch(() => {}), 5000);
-    setInterval(() => monitorManagedWhatsApp().catch(() => {}), 60000);
+    setInterval(() => monitorManagedWhatsApp().catch(() => {}), 300000);
     setTimeout(() => monitorModelPools().catch(() => {}), 15000);
     setInterval(() => monitorModelPools().catch(() => {}), 300000);
   });
