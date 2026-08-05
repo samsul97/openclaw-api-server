@@ -6,8 +6,8 @@
 // IMPORTANT: Run this ONLY while the openclaw gateway for this profile is STOPPED.
 // The caller (VPS API) is responsible for stop/start of the gateway service.
 
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const { ensureParticipants } = require('./wa-group-participants');
+const { loadManagedBaileys, createAtomicCredsSaver } = require('./wa-create-groups');
 
 const NOOP_LOGGER = {
   trace: () => {}, debug: () => {}, info: () => {},
@@ -41,22 +41,35 @@ async function main() {
   }, 45000);
 
   try {
+    const {
+      default: makeWASocket,
+      useMultiFileAuthState,
+      fetchLatestBaileysVersion,
+      makeCacheableSignalKeyStore,
+      BufferJSON,
+      packageName,
+      packageVersion,
+    } = await loadManagedBaileys(credsDir);
     const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1023926] }));
-    const { state, saveCreds } = await useMultiFileAuthState(credsDir);
+    const { state } = await useMultiFileAuthState(credsDir);
+    const credsSaver = createAtomicCredsSaver(credsDir, state, BufferJSON);
 
     const sock = makeWASocket({
       version,
-      auth: state,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, NOOP_LOGGER),
+      },
       printQRInTerminal: false,
       logger: NOOP_LOGGER,
-      browser: ['OpenClaw', 'Chrome', '10.0'],
+      browser: ['openclaw', 'cli', '2026.6.6'],
       connectTimeoutMs: 30000,
       defaultQueryTimeoutMs: 20000,
       generateHighQualityLinkPreview: false,
       syncFullHistory: false,
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', credsSaver.save);
 
     sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
       if (connection === 'open') {
@@ -85,6 +98,7 @@ async function main() {
           }
 
           clearTimeout(timeout);
+          await credsSaver.flush();
           out({
             ok: true,
             partial_success: missingPhones.length > 0,
@@ -99,9 +113,11 @@ async function main() {
             warning: missingPhones.length > 0
               ? 'Group dibuat, tetapi member belum terverifikasi masuk. Gunakan link undangan.'
               : null,
+            runtime: `${packageName}@${packageVersion}`,
           });
           await sock.end();
         } catch (err) {
+          try { await credsSaver.flush(); } catch {}
           clearTimeout(timeout);
           out({ ok: false, error: err.message });
           await sock.end();

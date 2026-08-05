@@ -2897,7 +2897,7 @@ app.delete('/managed-router/:accountId/clients/:clientId/registry', (req, res) =
   res.json({ ok: true, removed, cron_jobs_removed: cronJobsRemoved });
 });
 
-app.post('/managed-router/:accountId/create-groups', (req, res) => {
+app.post('/managed-router/:accountId/create-groups', async (req, res) => {
   const accountId = parseInt(req.params.accountId);
   if (!Number.isInteger(accountId) || accountId < 1) {
     return res.status(400).json({ ok: false, error: 'Invalid accountId' });
@@ -2925,6 +2925,16 @@ app.post('/managed-router/:accountId/create-groups', (req, res) => {
     return res.status(400).json({ ok: false, error: 'Managed WhatsApp session is not paired' });
   }
 
+  const before = await getManagedChannelRuntime(accountId);
+  if (!before.connected) {
+    return res.status(409).json({
+      ok: false,
+      error: 'Managed WhatsApp session is not connected; pair or recover it before creating groups',
+      health_state: before.health_state,
+      error_category: before.error_category,
+    });
+  }
+
   const registryFile = path.join(base, 'provisioned-groups.json');
   const registry = readJsonFile(registryFile, {});
   const reused = [];
@@ -2938,13 +2948,18 @@ app.post('/managed-router/:accountId/create-groups', (req, res) => {
     return res.json({ ok: true, success: true, groups: reused, reused_count: reused.length, created_count: 0 });
   }
 
+  const credentialBackupsDir = path.join(base, 'credential-backups');
+  const credentialBackupDir = path.join(credentialBackupsDir, `group-create-${Date.now()}`);
+  fs.mkdirSync(credentialBackupsDir, { recursive: true, mode: 0o700 });
+  fs.cpSync(credsDir, credentialBackupDir, { recursive: true, force: false });
+  fs.chmodSync(credentialBackupDir, 0o700);
   try { run(`systemctl stop ${quote(serviceName)} 2>/dev/null || true`); } catch {}
   const scriptPath = path.join(__dirname, 'wa-create-groups.js');
   execFile(process.execPath, [scriptPath, credsDir, JSON.stringify(pending)], {
     encoding: 'utf8',
     timeout: 270000,
     maxBuffer: 1024 * 1024,
-  }, (error, stdout) => {
+  }, async (error, stdout) => {
     try { run(`systemctl start ${quote(serviceName)} 2>/dev/null || true`); } catch {}
 
     let result;
@@ -2970,6 +2985,24 @@ app.post('/managed-router/:accountId/create-groups', (req, res) => {
     fs.mkdirSync(base, { recursive: true });
     fs.writeFileSync(registryFile, JSON.stringify(registry, null, 2) + '\n');
 
+    let after = null;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 3000 : 2500));
+      after = await getManagedChannelRuntime(accountId);
+      if (after.connected) break;
+    }
+    if (!after?.connected) {
+      return res.status(502).json({
+        ok: false,
+        error: 'Groups were created, but the managed WhatsApp gateway did not reconnect',
+        groups: [...reused, ...result.groups],
+        created_count: result.groups.length,
+        credential_backup: credentialBackupDir,
+        health_state: after?.health_state,
+        error_category: after?.error_category,
+      });
+    }
+
     sendTelegram(
       `✅ <b>${result.groups.length} Group WA Managed dibuat</b>\n\n` +
       result.groups.map(group => {
@@ -2985,6 +3018,8 @@ app.post('/managed-router/:accountId/create-groups', (req, res) => {
       groups: [...reused, ...result.groups],
       reused_count: reused.length,
       created_count: result.groups.length,
+      gateway_reconnected: true,
+      credential_backup: credentialBackupDir,
     });
   });
 });
