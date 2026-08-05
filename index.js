@@ -1774,7 +1774,15 @@ app.post('/clients/:name/workspace/adapt', (req, res) => {
     }
     res.json({ ok: true, adapted: true, written });
   } catch (error) {
-    res.status(500).json({ ok: false, error: 'Structured workspace adaptation failed', detail: String(error.stderr || error.message || '').slice(0, 1000) });
+    let claudeError = null;
+    try { claudeError = JSON.parse(String(error.stdout || '')); } catch {}
+    const authRevoked = Number(claudeError?.api_error_status) === 401;
+    const detail = claudeError?.result || error.stderr || error.message || '';
+    res.status(authRevoked ? 401 : 500).json({
+      ok: false,
+      error: authRevoked ? 'claude_auth_revoked' : 'Structured workspace adaptation failed',
+      detail: String(detail).slice(0, 1000),
+    });
   }
 });
 
