@@ -96,10 +96,20 @@ async function main() {
         handled = true;
         const results = [];
         try {
+          let participatingGroups = [];
+          try {
+            participatingGroups = Object.values(await sock.groupFetchAllParticipating())
+              .sort((left, right) => Number(right.creation || 0) - Number(left.creation || 0));
+          } catch {}
+          const claimedGroupIds = new Set();
           for (let index = 0; index < groups.length; index += 1) {
             const spec = groups[index];
             const participantJid = `${String(spec.participant_phone).replace(/[^0-9]/g, '')}@s.whatsapp.net`;
-            const created = await sock.groupCreate(spec.group_name, [participantJid]);
+            const discovered = participatingGroups.find(group =>
+              group?.id && group.subject === spec.group_name && !claimedGroupIds.has(group.id)
+            );
+            const created = discovered || await sock.groupCreate(spec.group_name, [participantJid]);
+            claimedGroupIds.add(created.id);
             let descriptionSet = false;
             if (spec.description) {
               try {
@@ -127,6 +137,7 @@ async function main() {
               participant_count: verification.participantCount,
               invite_link: inviteLink,
               warning: participantAdded ? null : 'Owner belum masuk; gunakan link undangan tanpa retry otomatis.',
+              discovered_existing: Boolean(discovered),
             });
             if (index < groups.length - 1) await delay(5000);
           }

@@ -2981,12 +2981,10 @@ app.post('/managed-router/:accountId/create-groups', async (req, res) => {
     try { result = JSON.parse(stdout.trim()); } catch {
       return res.status(500).json({ ok: false, error: 'Failed to parse batch group output', raw: stdout.slice(0, 300) });
     }
-    if (error || !result.ok) {
-      return res.status(500).json({ ok: false, error: result?.error || error?.message || 'Batch group creation failed', groups: result?.groups || [] });
-    }
-
-    for (const group of result.groups) {
+    const completedGroups = Array.isArray(result?.groups) ? result.groups : [];
+    for (const group of completedGroups) {
       const source = pending.find(item => item.idempotency_key === group.idempotency_key);
+      if (!source || !group.group_id) continue;
       registry[group.idempotency_key] = {
         group_id: group.group_id,
         invite_link: group.invite_link || null,
@@ -2999,6 +2997,16 @@ app.post('/managed-router/:accountId/create-groups', async (req, res) => {
     }
     fs.mkdirSync(base, { recursive: true });
     fs.writeFileSync(registryFile, JSON.stringify(registry, null, 2) + '\n');
+
+    if (error || !result.ok) {
+      return res.status(500).json({
+        ok: false,
+        error: result?.error || error?.message || 'Batch group creation failed',
+        groups: completedGroups,
+        partial_registered_count: completedGroups.length,
+        credential_backup: credentialBackupDir,
+      });
+    }
 
     let after = null;
     for (let attempt = 0; attempt < 12; attempt += 1) {
