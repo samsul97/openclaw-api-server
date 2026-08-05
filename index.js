@@ -1756,7 +1756,7 @@ app.post('/clients/:name/workspace/adapt', (req, res) => {
     const raw = execFileSync(CLAUDE_BIN, [
       '--print', '--model', 'sonnet', '--output-format', 'json', '--json-schema', schema,
       '--tools', '', '--permission-mode', 'dontAsk', prompt,
-    ], { encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024, cwd: paths.workspaceDir });
+    ], { encoding: 'utf8', timeout: 270000, maxBuffer: 4 * 1024 * 1024, cwd: paths.workspaceDir });
     const envelope = JSON.parse(raw);
     const output = envelope.structured_output || envelope.result || envelope;
     const files = output.files || {};
