@@ -7,6 +7,7 @@
 // The caller (VPS API) is responsible for stop/start of the gateway service.
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { ensureParticipants } = require('./wa-group-participants');
 
 const NOOP_LOGGER = {
   trace: () => {}, debug: () => {}, info: () => {},
@@ -70,22 +71,10 @@ async function main() {
             } catch {}
           }
 
-          let metadata = result;
-          try {
-            metadata = await sock.groupMetadata(groupId);
-          } catch {
-            // The creation response still contains participant information on
-            // most WhatsApp versions, so metadata refresh is best-effort.
-          }
-
-          const participantIds = (metadata?.participants || result?.participants || [])
-            .flatMap(participant => [participant?.id, participant?.phoneNumber])
-            .filter(Boolean);
-          const addedPhones = participantJIDs.filter(requested => {
-            const digits = requested.replace(/[^0-9]/g, '');
-            return participantIds.some(actual => String(actual).replace(/[^0-9]/g, '').startsWith(digits));
-          });
-          const missingPhones = participantJIDs.filter(phone => !addedPhones.includes(phone));
+          const verification = await ensureParticipants(
+            sock, state.keys, groupId, participantJIDs, result
+          );
+          const missingPhones = verification.missing;
 
           let inviteLink = null;
           try {
@@ -102,7 +91,8 @@ async function main() {
             participant_added: missingPhones.length === 0,
             requested_participants: participantJIDs,
             missing_participants: missingPhones,
-            participant_count: participantIds.length,
+            participant_count: verification.participantCount,
+            participant_add_results: verification.addResults,
             group_id: groupId,
             description_set: descriptionSet,
             invite_link: inviteLink,

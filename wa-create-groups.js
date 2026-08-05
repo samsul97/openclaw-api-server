@@ -3,6 +3,7 @@
 // must stop the gateway first and start it again after this process exits.
 
 const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { ensureParticipants } = require('./wa-group-participants');
 
 const NOOP_LOGGER = {
   trace: () => {}, debug: () => {}, info: () => {}, warn: () => {},
@@ -22,7 +23,7 @@ async function main() {
     return output({ ok: false, error: 'Usage: wa-create-groups.js <creds_dir> <groups_json>' }, 1);
   }
 
-  const timer = setTimeout(() => output({ ok: false, error: 'Timeout: batch group creation took too long' }, 1), 150000);
+  const timer = setTimeout(() => output({ ok: false, error: 'Timeout: batch group creation took too long' }, 1), 240000);
   try {
     const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1023926] }));
     const { state, saveCreds } = await useMultiFileAuthState(credsDir);
@@ -56,13 +57,10 @@ async function main() {
                 descriptionSet = true;
               } catch {}
             }
-            let metadata = created;
-            try { metadata = await sock.groupMetadata(created.id); } catch {}
-            const participantIds = (metadata?.participants || created?.participants || [])
-              .flatMap(participant => [participant?.id, participant?.phoneNumber])
-              .filter(Boolean);
-            const digits = participantJid.replace(/[^0-9]/g, '');
-            const participantAdded = participantIds.some(actual => String(actual).replace(/[^0-9]/g, '').startsWith(digits));
+            const verification = await ensureParticipants(
+              sock, state.keys, created.id, [participantJid], created
+            );
+            const participantAdded = verification.missing.length === 0;
             let inviteLink = null;
             if (!participantAdded) {
               try { inviteLink = `https://chat.whatsapp.com/${await sock.groupInviteCode(created.id)}`; } catch {}
@@ -75,6 +73,8 @@ async function main() {
               partial_success: !participantAdded,
               participant_added: participantAdded,
               missing_participants: participantAdded ? [] : [participantJid],
+              participant_add_results: verification.addResults,
+              participant_count: verification.participantCount,
               invite_link: inviteLink,
               warning: participantAdded ? null : 'Owner belum masuk; gunakan link undangan tanpa retry otomatis.',
             });

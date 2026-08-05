@@ -149,6 +149,77 @@ function writeJsonFileAtomic(file, value) {
   fs.renameSync(temporary, file);
 }
 
+const MANAGED_CLI_SCOPES = ['operator.admin', 'operator.pairing', 'operator.read', 'operator.write'];
+
+function ensureManagedCliOperatorScopes(paths) {
+  if (!paths?.stateDir || !/^\/root\/\.openclaw\/managed-accounts\/[1-9][0-9]*$/.test(paths.stateDir)) {
+    return { changed: false, reason: 'not-managed-state' };
+  }
+
+  const identityFile = path.join(paths.stateDir, 'identity', 'device.json');
+  const authFile = path.join(paths.stateDir, 'identity', 'device-auth.json');
+  const pairedFile = path.join(paths.stateDir, 'devices', 'paired.json');
+  const pendingFile = path.join(paths.stateDir, 'devices', 'pending.json');
+  const identity = readJsonFile(identityFile, null);
+  const auth = readJsonFile(authFile, null);
+  const paired = readJsonFile(pairedFile, {});
+  if (!identity?.deviceId || !identity?.publicKey || auth?.deviceId !== identity.deviceId) {
+    return { changed: false, reason: 'local-identity-not-ready' };
+  }
+
+  const entry = paired[identity.deviceId];
+  const pairedToken = entry?.tokens?.operator?.token;
+  const localToken = auth?.tokens?.operator?.token;
+  if (!entry || entry.publicKey !== identity.publicKey || entry.clientId !== 'cli'
+      || entry.clientMode !== 'cli' || entry.role !== 'operator'
+      || !pairedToken || pairedToken !== localToken) {
+    return { changed: false, reason: 'local-identity-mismatch' };
+  }
+
+  const sameScopes = (actual, expected) => JSON.stringify([...(actual || [])].sort()) === JSON.stringify([...expected].sort());
+  let changed = false;
+  if (!sameScopes(entry.scopes, ['operator.read', 'operator.admin', 'operator.pairing'])) {
+    entry.scopes = ['operator.read', 'operator.admin', 'operator.pairing'];
+    changed = true;
+  }
+  if (!sameScopes(entry.approvedScopes, ['operator.read', 'operator.admin', 'operator.pairing'])) {
+    entry.approvedScopes = ['operator.read', 'operator.admin', 'operator.pairing'];
+    changed = true;
+  }
+  if (!sameScopes(entry.tokens.operator.scopes, MANAGED_CLI_SCOPES)) {
+    entry.tokens.operator.scopes = [...MANAGED_CLI_SCOPES];
+    changed = true;
+  }
+  if (!sameScopes(auth.tokens.operator.scopes, MANAGED_CLI_SCOPES)) {
+    auth.tokens.operator.scopes = [...MANAGED_CLI_SCOPES];
+    auth.tokens.operator.updatedAtMs = Date.now();
+    changed = true;
+  }
+
+  const pending = readJsonFile(pendingFile, {});
+  let pendingChanged = false;
+  for (const [requestId, request] of Object.entries(pending)) {
+    if (request?.deviceId !== identity.deviceId) continue;
+    delete pending[requestId];
+    pendingChanged = true;
+  }
+
+  if (changed) {
+    writeJsonFileAtomic(pairedFile, paired);
+    writeJsonFileAtomic(authFile, auth);
+  }
+  if (pendingChanged) writeJsonFileAtomic(pendingFile, pending);
+  return { changed: changed || pendingChanged, reason: 'local-managed-cli' };
+}
+
+function prepareManagedCronAccess(paths) {
+  const result = ensureManagedCliOperatorScopes(paths);
+  if (!result.changed) return result;
+  run(`systemctl restart ${quote(paths.serviceName)}`);
+  sleepSync(2000);
+  return result;
+}
+
 function formatBytes(value) {
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let amount = Number(value);
@@ -1649,6 +1720,7 @@ app.put('/clients/:name/crons', (req, res) => {
   const port = config.gateway?.port;
   const token = config.gateway?.auth?.token;
   if (!port || !token) return res.status(422).json({ ok: false, error: 'Gateway port/token missing' });
+  if (managedPaths) prepareManagedCronAccess(managedPaths);
   const connection = ['--url', `ws://127.0.0.1:${port}`, '--token', token];
   const cronExecOptions = { encoding: 'utf8', timeout: 30000, ...(managedPaths ? { env: openClawEnv(managedPaths) } : {}) };
 
@@ -1835,6 +1907,7 @@ app.post('/clients/:name/crons/activate', async (req, res) => {
   const validTarget = (target) => /^120[0-9]+@g\.us$/.test(target) || /^\+[1-9][0-9]{6,14}$/.test(target);
   const invalidJob = jobs.find((job) => !job.assistant_slot || !validTarget(String(targets[job.assistant_slot] || '')));
   if (invalidJob) return res.status(422).json({ ok: false, error: `Missing or invalid WhatsApp target for assistant slot ${invalidJob.assistant_slot || '?'}` });
+  if (managedPaths) prepareManagedCronAccess(managedPaths);
   const connection = ['--url', `ws://127.0.0.1:${config.gateway?.port}`, '--token', config.gateway?.auth?.token];
   const cronExecOptions = { encoding: 'utf8', timeout: 30000, ...(managedPaths ? { env: openClawEnv(managedPaths) } : {}) };
   try {
@@ -2054,7 +2127,7 @@ app.post('/clients/:name/groups/create', (req, res) => {
     const cmd = `${quote(nodebin)} ${quote(scriptPath)} ${quote(credsDir)} ${quote(group_name)} ${quote(user_phone)}`;
 
     exec(cmd, {
-      encoding: 'utf8', timeout: 60000,
+      encoding: 'utf8', timeout: 90000,
       env: { ...process.env, WA_GROUP_DESCRIPTION: description },
     }, (error, stdout) => {
       // Always restart gateway regardless of outcome
@@ -2860,7 +2933,7 @@ app.post('/managed-router/:accountId/create-groups', (req, res) => {
   const scriptPath = path.join(__dirname, 'wa-create-groups.js');
   execFile(process.execPath, [scriptPath, credsDir, JSON.stringify(pending)], {
     encoding: 'utf8',
-    timeout: 180000,
+    timeout: 270000,
     maxBuffer: 1024 * 1024,
   }, (error, stdout) => {
     try { run(`systemctl start ${quote(serviceName)} 2>/dev/null || true`); } catch {}
