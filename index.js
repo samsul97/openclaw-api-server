@@ -2230,6 +2230,20 @@ function managedAccountPaths(accountId) {
   };
 }
 
+function managedAccountCliRuntime(accountId) {
+  const paths = managedAccountPaths(accountId);
+  const runtimeFile = path.join(paths.base, 'cli-runtime.json');
+  const configured = readJsonFile(runtimeFile, null);
+  const nodeBin = configured?.node_bin;
+  const openclawBin = configured?.openclaw_bin;
+  if (typeof nodeBin === 'string' && typeof openclawBin === 'string'
+      && path.isAbsolute(nodeBin) && path.isAbsolute(openclawBin)
+      && fs.existsSync(nodeBin) && fs.existsSync(openclawBin)) {
+    return { nodeBin, openclawBin };
+  }
+  return { nodeBin: NODE_BIN, openclawBin: OPENCLAW_BIN };
+}
+
 function readManagedRoutes(accountId) {
   const { routesFile } = managedAccountPaths(accountId);
   if (!fs.existsSync(routesFile)) return [];
@@ -2690,7 +2704,8 @@ app.post('/managed-router/:accountId/login/start', (req, res) => {
     });
   }
 
-  const command = `${NODE_BIN} ${OPENCLAW_BIN} channels login --channel whatsapp`;
+  const cliRuntime = managedAccountCliRuntime(accountId);
+  const command = `${quote(cliRuntime.nodeBin)} ${quote(cliRuntime.openclawBin)} channels login --channel whatsapp`;
   const child = spawn('/usr/bin/script', ['-qefc', command, '/dev/null'], {
     env: { ...process.env, HOME: '/root', OPENCLAW_STATE_DIR: paths.base, OPENCLAW_CONFIG_PATH: paths.configPath, CODEX_HOME: '/root/.codex', TERM: 'xterm-256color' },
     stdio: ['ignore', 'pipe', 'pipe'],
