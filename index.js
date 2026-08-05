@@ -172,14 +172,14 @@ function ensureManagedCliOperatorScopes(paths) {
   const identity = readJsonFile(identityFile, null);
   const auth = readJsonFile(authFile, null);
   const paired = readJsonFile(pairedFile, {});
-  if (!identity?.deviceId || !identity?.publicKey || auth?.deviceId !== identity.deviceId) {
+  if (!identity?.deviceId || auth?.deviceId !== identity.deviceId) {
     return { changed: false, reason: 'local-identity-not-ready' };
   }
 
   const entry = paired[identity.deviceId];
   const pairedToken = entry?.tokens?.operator?.token;
   const localToken = auth?.tokens?.operator?.token;
-  if (!entry || entry.publicKey !== identity.publicKey || entry.clientId !== 'cli'
+  if (!entry || entry.clientId !== 'cli'
       || entry.clientMode !== 'cli' || entry.role !== 'operator'
       || !pairedToken || pairedToken !== localToken) {
     return { changed: false, reason: 'local-identity-mismatch' };
