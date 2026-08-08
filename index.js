@@ -949,6 +949,35 @@ function writeClientConfig(name, config) {
   chownIfHome(paths, paths.configPath);
 }
 
+function assertClientPortAvailable(name, port) {
+  if (!Number.isInteger(port) || port < 1024 || port > 65535 || (port - 19789) % 20 !== 0) {
+    throw new Error(`Invalid client gateway port: ${port}`);
+  }
+  for (const otherName of discoverClients()) {
+    if (otherName === name) continue;
+    const otherPort = Number(getClientConfig(otherName)?.gateway?.port || 0);
+    if (otherPort === port) throw new Error(`Gateway port ${port} already used by client ${otherName}`);
+  }
+}
+
+function reconcileClientServicePort(name, port) {
+  assertClientPortAvailable(name, port);
+  const paths = clientPaths(name);
+  if (paths.serviceScope !== 'system') return false;
+  const serviceFile = `/etc/systemd/system/${paths.serviceName}`;
+  if (!fs.existsSync(serviceFile)) return false;
+  const current = fs.readFileSync(serviceFile, 'utf8');
+  const next = current
+    .replace(/(gateway --port )\d+/g, `$1${port}`)
+    .replace(/(Environment=OPENCLAW_GATEWAY_PORT=)\d+/g, `$1${port}`);
+  if (next === current) return false;
+  const temporary = `${serviceFile}.tmp-${process.pid}`;
+  fs.writeFileSync(temporary, next, { mode: 0o644 });
+  fs.renameSync(temporary, serviceFile);
+  run('systemctl daemon-reload');
+  return true;
+}
+
 function getServiceStatus(name) {
   const paths = clientPaths(name);
   try {
@@ -1366,6 +1395,16 @@ app.post('/clients/validate-provision', (req, res) => {
     if (!isAllowedWorkspaceFile(file)) errors.push(`Unsupported workspace file: ${file}`);
   }
   if (!config || typeof config !== 'object' || Array.isArray(config)) errors.push('config must be an object');
+  const requestedPort = Number(config?.server_port);
+  if (!Number.isInteger(requestedPort) || requestedPort < 1024 || requestedPort > 65535 || (requestedPort - 19789) % 20 !== 0) {
+    errors.push('Invalid or missing config.server_port');
+  } else {
+    try {
+      assertClientPortAvailable(name, requestedPort);
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
   try {
     normalizeDashboardModelProvider(config?.model_provider, config?.primary_model);
   } catch (error) {
@@ -1452,15 +1491,21 @@ app.get('/clients/:name', (req, res) => {
 });
 
 app.post('/clients', (req, res) => {
-  const { name, trigger, phone, scope_package = 'personal', assistant_type = 'custom', blueprint } = req.body;
+  const { name, trigger, phone, scope_package = 'personal', assistant_type = 'custom', blueprint, server_port } = req.body;
 
   if (!name || !trigger || !phone) return res.status(400).json({ ok: false, error: 'name, trigger, phone are required' });
   if (!validName(name)) return res.status(400).json({ ok: false, error: 'name must be lowercase alphanumeric/dash/underscore' });
   if (!/^\+62[0-9]{9,13}$/.test(phone)) return res.status(400).json({ ok: false, error: 'phone must be E.164 format starting with +62' });
   if (!['personal', 'team'].includes(scope_package)) return res.status(400).json({ ok: false, error: 'scope_package must be personal or team' });
   if (!VALID_ASSISTANT_TYPES.includes(assistant_type)) return res.status(400).json({ ok: false, error: `assistant_type must be one of: ${VALID_ASSISTANT_TYPES.join('|')}` });
+  const requestedPort = Number(server_port);
+  try {
+    assertClientPortAvailable(name, requestedPort);
+  } catch (error) {
+    return res.status(422).json({ ok: false, error: error.message });
+  }
 
-  const cmd = `bash ${quote(path.join(SCRIPTS_DIR, 'create-client.sh'))} ${quote(name)} ${quote(trigger)} ${quote(phone)} ${quote(scope_package)} ${quote(assistant_type)} 2>&1`;
+  const cmd = `bash ${quote(path.join(SCRIPTS_DIR, 'create-client.sh'))} ${quote(name)} ${quote(trigger)} ${quote(phone)} ${quote(scope_package)} ${quote(assistant_type)} ${quote(requestedPort)} 2>&1`;
 
   exec(cmd, { encoding: 'utf8', timeout: 120000 }, (error, stdout, stderr) => {
     if (error && !String(stdout || '').includes('berhasil dibuat')) {
@@ -1506,6 +1551,11 @@ app.patch('/clients/:name', (req, res) => {
 
   if (fullDashboardPayload) {
     const next = buildConfigFromDashboard(name, req.body, existing);
+    try {
+      reconcileClientServicePort(name, Number(next.gateway?.port));
+    } catch (error) {
+      return res.status(422).json({ ok: false, error: error.message });
+    }
     writeClientConfig(name, next);
     const sessionReset = req.body.single_model_mode === true
       ? clearClientSessionModelOverrides(name)
